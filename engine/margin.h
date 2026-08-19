@@ -289,6 +289,19 @@ struct NakedRules {
     NakedPolicy put = NakedPolicy::FullStrike;
     const char* call_refusal = "uncovered short call is not permitted";
     const char* put_refusal = "uncovered short put is not permitted";
+
+    // Equity legs. Stock previously carried no requirement at all, long or
+    // short, so $500k of short stock required nothing -- and shares arrive on
+    // every assignment, which is how the covered call, PMCC and collar families
+    // all ended up with an unmargined book.
+    //
+    // Reg-T initial margin on long stock is 50% (12 CFR 220.12(a)); a cash
+    // account pays in full. A short sale requires 100% of the proceeds plus 50%
+    // margin, so 150% of market value.
+    double long_stock_fraction = 0.50;
+    double short_stock_fraction = 1.50;
+    bool allow_short_stock = true;
+    const char* short_stock_refusal = "short stock is not permitted";
 };
 
 // Shared evaluation. The three published models differ only in what they do
@@ -300,6 +313,24 @@ inline MarginResult evaluate_with(
 {
     MarginResult res;
     auto groups = detail::split_by_underlying(book.snapshot(), registry);
+
+    // Equity legs are charged on the full holding, independently of whether some
+    // of it also collateralizes a short call: a covered call requires margin on
+    // the stock and nothing extra on the option, not the reverse.
+    for (const EquityPosition& e : book.equity_snapshot()) {
+        if (e.shares == 0) continue;
+        const Money spot = ctx.underlying_or_zero(e.symbol);
+        if (e.shares > 0) {
+            res.requirement += scale(Money{spot.micros * e.shares}, rules.long_stock_fraction);
+        } else {
+            if (!rules.allow_short_stock) {
+                res.disallowed = true;
+                res.disallowed_reason = rules.short_stock_refusal;
+            }
+            res.requirement += scale(Money{spot.micros * (-e.shares)},
+                                     rules.short_stock_fraction);
+        }
+    }
 
     for (auto& [underlying, legs] : groups) {
         const Money spot = ctx.underlying_or_zero(underlying);
@@ -370,10 +401,14 @@ public:
     MarginResult evaluate(const PositionBook& book, const ContractRegistry& registry,
                           const MarginContext& ctx) const override
     {
-        return evaluate_with(book, registry, ctx, NakedRules{
+        NakedRules rules{
             NakedPolicy::Disallow, NakedPolicy::FullStrike,
             "cash account cannot hold an uncovered short call",
-            "cash account short put must be cash secured"});
+            "cash account short put must be cash secured"};
+        rules.long_stock_fraction = 1.00;
+        rules.allow_short_stock = false;
+        rules.short_stock_refusal = "a cash account cannot sell stock short";
+        return evaluate_with(book, registry, ctx, rules);
     }
 };
 

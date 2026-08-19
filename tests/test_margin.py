@@ -34,6 +34,16 @@ def micros(dollars: float) -> int:
     return round(dollars * 1_000_000)
 
 
+def stock_charge(shares: int, *, spot: float = SPOT, fraction: float = 0.50) -> float:
+    """
+    Reg-T margin on a stock holding.
+
+    A covered call requires margin on the STOCK and none on the call, so a
+    covered-call requirement is this number rather than zero.
+    """
+    return fraction * spot * shares
+
+
 def reg_t_naked_dollars(
     *, strike, spot, is_call, premium, shares=SHARES_PER_CONTRACT, contracts=1
 ):
@@ -227,12 +237,17 @@ class TestCoveredCall:
     @pytest.mark.parametrize(
         "model", [E.MarginModel.CASH_ACCOUNT, E.MarginModel.REG_T, E.MarginModel.ROBINHOOD]
     )
-    def test_shares_cover_the_short_call_at_no_requirement(self, model):
+    def test_shares_cover_the_short_call_so_only_the_stock_is_charged(self, model):
+        """
+        Reg-T charges margin on the stock and nothing on the call. A cash account
+        pays for the stock in full.
+        """
         short = make_contract(1, strike=105.0, expiry_day=30)
 
         result = margin(model, [short], [(1, -1)], shares={SYMBOL: 100}, marks={1: 2.0})
 
-        assert result.requirement_micros == 0
+        fraction = 1.00 if model == E.MarginModel.CASH_ACCOUNT else 0.50
+        assert result.requirement_micros == micros(stock_charge(100, fraction=fraction))
         assert not result.disallowed
         assert only(result.pairings).covered_by_equity
 
@@ -243,7 +258,7 @@ class TestCoveredCall:
             E.MarginModel.ROBINHOOD, [short], [(1, -2)], shares={SYMBOL: 200}
         )
 
-        assert result.requirement_micros == 0
+        assert result.requirement_micros == micros(stock_charge(200))
         assert not result.disallowed
         pairing = only(result.pairings)
         assert pairing.covered_by_equity
@@ -279,7 +294,7 @@ class TestCoveredCall:
 
         expected = reg_t_naked_dollars(
             strike=105.0, spot=SPOT, is_call=True, premium=2.0
-        )
+        ) + stock_charge(100)
         assert result.requirement_micros == micros(expected)
 
     def test_shares_are_consumed_by_one_short_call_and_not_reused_by_another(self):
@@ -296,7 +311,7 @@ class TestCoveredCall:
 
         expected = reg_t_naked_dollars(
             strike=110.0, spot=SPOT, is_call=True, premium=1.0
-        )
+        ) + stock_charge(100)
         assert result.requirement_micros == micros(expected)
         covered = [p for p in result.pairings if p.covered_by_equity]
         assert [p.short_leg for p in covered] == [1]
@@ -309,7 +324,11 @@ class TestCoveredCall:
             E.MarginModel.ROBINHOOD, [short_put], [(1, -1)], shares={SYMBOL: 100}
         )
 
-        assert result.requirement_micros == micros(95.0 * SHARES_PER_CONTRACT)
+        # The put is secured at its full strike, and the long stock is margined
+        # in its own right rather than offsetting it.
+        assert result.requirement_micros == micros(
+            95.0 * SHARES_PER_CONTRACT + stock_charge(100)
+        )
         assert not only(result.pairings).covered_by_equity
 
 
@@ -601,7 +620,9 @@ class TestAdjustedDeliverable:
             E.MarginModel.ROBINHOOD, [short], [(1, -1)], shares={SYMBOL: 100}
         )
 
-        assert covered.requirement_micros == 0
+        # Covering a 400-share deliverable needs 400 shares, and those shares are
+        # themselves margined; the call adds nothing.
+        assert covered.requirement_micros == micros(stock_charge(400))
         assert only(covered.pairings).covered_by_equity
         assert under_covered.disallowed
 
@@ -804,3 +825,63 @@ class TestMixedDeliverablePairing:
         result = margin(E.MarginModel.ROBINHOOD, self._legs(100, 400), self.HOLDINGS,
                         marks={self.SHORT: 5.0})
         assert result.disallowed
+
+
+class TestEquityMargin:
+    """
+    Stock carried no requirement at all, long or short.
+
+    Shares arrive on every assignment, so this left the entire covered-call,
+    PMCC and collar family with an unmargined book while reporting a $0
+    requirement and no breach.
+    """
+
+    SPOT = 500.0
+    SHARES = 1000
+    NOTIONAL = SPOT * SHARES
+
+    def test_long_stock_is_charged_reg_t_initial(self):
+        result = margin(E.MarginModel.REG_T, [], [], spot=self.SPOT,
+                        shares={SYMBOL: self.SHARES})
+        assert result.requirement_micros == micros(0.50 * self.NOTIONAL)
+
+    def test_short_stock_is_charged_proceeds_plus_margin(self):
+        """A short sale requires 100% of the proceeds plus 50%, so 150%."""
+        result = margin(E.MarginModel.REG_T, [], [], spot=self.SPOT,
+                        shares={SYMBOL: -self.SHARES})
+        assert result.requirement_micros == micros(1.50 * self.NOTIONAL)
+
+    def test_a_cash_account_pays_for_stock_in_full(self):
+        result = margin(E.MarginModel.CASH_ACCOUNT, [], [],
+                        spot=self.SPOT, shares={SYMBOL: self.SHARES})
+        assert result.requirement_micros == micros(self.NOTIONAL)
+
+    def test_a_cash_account_cannot_short_stock(self):
+        result = margin(E.MarginModel.CASH_ACCOUNT, [], [],
+                        spot=self.SPOT, shares={SYMBOL: -self.SHARES})
+        assert result.disallowed
+        assert "short" in result.disallowed_reason
+
+    def test_a_covered_call_charges_the_stock_and_nothing_for_the_call(self):
+        """
+        Reg-T requires margin on the stock and none on the call. Charging the
+        option instead of the stock, or neither, are both wrong.
+        """
+        short = make_contract(1, strike=105.0, expiry_day=30)
+        result = margin(E.MarginModel.REG_T, [short], [(1, -1)],
+                        spot=100.0, marks={1: 5.0},
+                        shares={SYMBOL: 100})
+        assert result.requirement_micros == micros(0.50 * 100.0 * 100)
+        assert only(result.pairings).covered_by_equity
+
+    def test_flat_equity_is_not_charged(self):
+        result = margin(E.MarginModel.REG_T, [], [], spot=self.SPOT,
+                        shares={SYMBOL: 0})
+        assert result.requirement_micros == 0
+
+    def test_the_charge_scales_with_the_holding(self):
+        one = margin(E.MarginModel.REG_T, [], [], spot=self.SPOT,
+                     shares={SYMBOL: 100}).requirement_micros
+        ten = margin(E.MarginModel.REG_T, [], [], spot=self.SPOT,
+                     shares={SYMBOL: 1000}).requirement_micros
+        assert ten == 10 * one

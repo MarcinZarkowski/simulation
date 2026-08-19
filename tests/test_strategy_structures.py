@@ -594,14 +594,17 @@ class TestEquityBackedStructures:
         assert h.shares_of(UNDERLYING) == SHARES_PER_CONTRACT
         return h
 
-    def test_call_written_against_exercised_shares_is_free_and_reported_covered(self, account):
+    def test_call_written_against_exercised_shares_charges_only_the_stock(self, account):
         h = self.with_shares(account)
         trade(h, [sell(self.WRITTEN_CALL)], {self.WRITTEN_CALL: 2.00},
               day=NEAR + 1, spot=self.SPOT_AT_EXPIRY)
 
         assert h.quantity_of(self.WRITTEN_CALL) == -1
         assert h.shares_of(UNDERLYING) == SHARES_PER_CONTRACT
-        assert requirement(h) == 0.0
+        # Reg-T margins the stock at 50% and charges nothing for the call, so the
+        # covered call's requirement is the stock's, not zero.
+        assert requirement(h) == pytest.approx(
+            0.50 * self.SPOT_AT_EXPIRY * SHARES_PER_CONTRACT)
         assert h.cash_micros == dollars(
             INITIAL_CASH - self.CALL_PREMIUM * SHARES_PER_CONTRACT
             - self.STRIKE * SHARES_PER_CONTRACT + 2.00 * SHARES_PER_CONTRACT)
@@ -610,14 +613,17 @@ class TestEquityBackedStructures:
         assert pairing.covered_by_equity
         assert pairing.requirement == 0.0
 
-    def test_protective_put_over_exercised_shares_requires_no_margin(self, account):
+    def test_protective_put_over_exercised_shares_charges_only_the_stock(self, account):
         h = self.with_shares(account)
         trade(h, [buy(self.PROTECTIVE_PUT)], {self.PROTECTIVE_PUT: 3.00},
               day=NEAR + 1, spot=self.SPOT_AT_EXPIRY)
 
         assert h.quantity_of(self.PROTECTIVE_PUT) == 1
         assert h.shares_of(UNDERLYING) == SHARES_PER_CONTRACT
-        assert requirement(h) == 0.0
+        # The long put costs its premium and adds no requirement; the stock is
+        # margined in its own right.
+        assert requirement(h) == pytest.approx(
+            0.50 * self.SPOT_AT_EXPIRY * SHARES_PER_CONTRACT)
         assert h.cash_micros == dollars(
             INITIAL_CASH - self.CALL_PREMIUM * SHARES_PER_CONTRACT
             - self.STRIKE * SHARES_PER_CONTRACT - 3.00 * SHARES_PER_CONTRACT)
