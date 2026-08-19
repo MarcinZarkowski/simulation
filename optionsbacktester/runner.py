@@ -207,6 +207,15 @@ def run(
     strategies.append(strategy_factory())
 
     contracts: dict[int, E.OptionContractVersion] = {}
+    # One registry, shared by every engine and grown in place. Each engine used to
+    # hold its own copy, re-set from the full cumulative set once per day, so both
+    # memory and per-day work scaled with paths x contracts: ~1.8 GiB of registries
+    # alone for 8,000 contracts across 1,000 paths. The registry is read-only during
+    # a run, so one copy serves every path.
+    registry = E.ContractRegistry()
+    for engine in engines:
+        engine.share_registry(registry)
+
     files_read: list[Path] = []
     day_count = 0
 
@@ -218,8 +227,8 @@ def run(
 
         new_contracts = build_contracts(day.options, ticker)
         contracts.update(new_contracts)
-        for engine in engines:
-            engine.set_contracts(list(contracts.values()))
+        for contract in new_contracts.values():
+            registry.add(contract)
 
         transitions = build_lineage_transitions(day.lineage_events, contracts)
         if transitions:

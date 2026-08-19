@@ -199,8 +199,19 @@ public:
     explicit Engine(BacktestConfig cfg)
         : cfg_(std::move(cfg)), margin_(make_margin_model(cfg_.margin_model)) {}
 
-    void set_registry(ContractRegistry registry) { registry_ = std::move(registry); }
-    const ContractRegistry& registry() const { return registry_; }
+    // Shared, not copied. Every Engine previously held its own ContractRegistry by
+    // value and the runner re-set it once per day per path with the full
+    // cumulative contract set, so memory scaled with paths x contracts: measured
+    // at ~1.8 GiB of registries alone for 8,000 contracts across 1,000 paths, and
+    // a real ticker-year carries tens of thousands of versions. The registry is
+    // read-only during a run, so one copy serves every path.
+    void set_registry(std::shared_ptr<const ContractRegistry> registry) {
+        registry_ = std::move(registry);
+    }
+    const ContractRegistry& registry() const {
+        static const ContractRegistry kEmpty;
+        return registry_ ? *registry_ : kEmpty;
+    }
 
     // Lineage transitions are applied before any bar of the session, so a
     // position's identity is already correct when market data arrives.
@@ -440,7 +451,7 @@ private:
     // P&L for a book the engine has already declared unsourceable.
     void quarantine(ContractVersionId cv, int64_t held, const std::string& why) {
         const Position* p = book_.find(cv);
-        const OptionContractVersion* c = registry_.find(cv);
+        const OptionContractVersion* c = registry().find(cv);
         const int64_t multiplier = c ? c->quote_multiplier : 100;
         const Money mark = mark_for(cv);
         const Money entry_avg = p ? p->average_cost() : Money::zero();
@@ -475,7 +486,7 @@ private:
         const Money basis = parent->cost_basis;
 
         const int64_t child_qty = held / t.parent_contracts * t.child_contracts;
-        const OptionContractVersion* child = registry_.find(t.child_version_id);
+        const OptionContractVersion* child = registry().find(t.child_version_id);
         if (child == nullptr || child_qty == 0) return;
 
         // Remove the parent at its own average cost, which realizes nothing.
@@ -506,7 +517,7 @@ private:
     }
 
     SpreadFeatures features_for(const Order& o, Money mark) const {
-        const OptionContractVersion* c = registry_.find(o.contract_version_id);
+        const OptionContractVersion* c = registry().find(o.contract_version_id);
         const MarketBar* b = bar_for(o.contract_version_id);
         const OptionAnalytics* a = analytics_for(o.contract_version_id);
 
@@ -584,7 +595,7 @@ private:
                 break;
             }
 
-            p.contract = registry_.find(o.contract_version_id);
+            p.contract = registry().find(o.contract_version_id);
             if (p.contract == nullptr) { reason = RejectReason::ContractNotTradable; detail = "unknown contract version"; break; }
             if (!p.contract->covers(now_)) { reason = RejectReason::ContractNotTradable; detail = "contract version not valid at fill time"; break; }
             if (superseded_versions_.count(o.contract_version_id.value)) {
@@ -731,7 +742,7 @@ private:
         PositionBook probe = book_;
         mutate(probe);
 
-        const MarginResult res = margin_->evaluate(probe, registry_, margin_context());
+        const MarginResult res = margin_->evaluate(probe, registry(), margin_context());
         if (res.disallowed) {
             *reason = RejectReason::BrokerDisallowed;
             *detail = res.disallowed_reason;
@@ -780,7 +791,7 @@ private:
 
             for (const Position& p : probe.snapshot()) {
                 if (p.kind != EquityKind::Option || p.quantity == 0) continue;
-                const OptionContractVersion* c = registry_.find(p.contract_version_id);
+                const OptionContractVersion* c = registry().find(p.contract_version_id);
                 if (c == nullptr) continue;
                 const int64_t qty = p.abs_quantity();
                 contracts_by_underlying[c->underlying_symbol] += qty;
@@ -837,7 +848,7 @@ private:
     }
 
     MarginResult current_margin() const {
-        return margin_->evaluate(book_, registry_, margin_context());
+        return margin_->evaluate(book_, registry(), margin_context());
     }
 
     // -----------------------------------------------------------------------
@@ -861,7 +872,7 @@ private:
     Money probe_market_value(const PositionBook& book) const {
         Money total = Money::zero();
         for (const Position& p : book.snapshot()) {
-            const OptionContractVersion* c = registry_.find(p.contract_version_id);
+            const OptionContractVersion* c = registry().find(p.contract_version_id);
             const int64_t mult = c ? c->quote_multiplier : 100;
             total += Money{mark_for(p.contract_version_id).micros * mult * p.quantity};
         }
@@ -873,7 +884,7 @@ private:
     Money unrealized_pnl() const {
         Money total = Money::zero();
         for (const Position& p : book_.snapshot()) {
-            const OptionContractVersion* c = registry_.find(p.contract_version_id);
+            const OptionContractVersion* c = registry().find(p.contract_version_id);
             const int64_t mult = c ? c->quote_multiplier : 100;
             total += Money{mark_for(p.contract_version_id).micros * mult * p.quantity} - p.cost_basis;
         }
@@ -890,7 +901,7 @@ private:
 
         for (const Position& p : book_.snapshot()) {
             if (p.kind != EquityKind::Option || p.quantity == 0) continue;
-            const OptionContractVersion* c = registry_.find(p.contract_version_id);
+            const OptionContractVersion* c = registry().find(p.contract_version_id);
             if (c == nullptr || c->expiration > cutoff) continue;
 
             // Settlement needs an observed underlying price. Falling back to zero
@@ -1045,7 +1056,7 @@ private:
 
     BacktestConfig cfg_;
     std::unique_ptr<MarginModel> margin_;
-    ContractRegistry registry_;
+    std::shared_ptr<const ContractRegistry> registry_;
 
     PositionBook book_;
     Ledger ledger_;

@@ -511,6 +511,11 @@ PYBIND11_MODULE(obt_engine, m) {
         .def_readonly("margin_disallowed", &AccountState::margin_disallowed)
         .def_readonly("margin_disallowed_reason", &AccountState::margin_disallowed_reason);
 
+    py::class_<ContractRegistry, std::shared_ptr<ContractRegistry>>(m, "ContractRegistry")
+        .def(py::init<>())
+        .def("add", &ContractRegistry::add, py::arg("contract"))
+        .def("size", &ContractRegistry::size);
+
     py::class_<MarketSnapshot>(m, "MarketSnapshot")
         .def(py::init<>())
         .def_property("timestamp",
@@ -566,15 +571,25 @@ PYBIND11_MODULE(obt_engine, m) {
     py::class_<Engine>(m, "Engine")
         .def(py::init<BacktestConfig>(), py::arg("config"))
         .def("add_contract", [](Engine& e, const OptionContractVersion& c) {
-            ContractRegistry r = e.registry();
-            r.add(c);
+            auto r = std::make_shared<ContractRegistry>(e.registry());
+            r->add(c);
             e.set_registry(std::move(r));
         }, py::arg("contract"))
         .def("set_contracts", [](Engine& e, const std::vector<OptionContractVersion>& cs) {
-            ContractRegistry r;
-            for (const auto& c : cs) r.add(c);
+            auto r = std::make_shared<ContractRegistry>();
+            for (const auto& c : cs) r->add(c);
             e.set_registry(std::move(r));
         }, py::arg("contracts"))
+        // Builds the registry once and shares it across every engine, so a
+        // multi-path run holds one copy rather than one per path.
+        .def_static("make_registry", [](const std::vector<OptionContractVersion>& cs) {
+            auto r = std::make_shared<ContractRegistry>();
+            for (const auto& c : cs) r->add(c);
+            return r;
+        }, py::arg("contracts"))
+        .def("share_registry", [](Engine& e, std::shared_ptr<ContractRegistry> r) {
+            e.set_registry(std::move(r));
+        }, py::arg("registry"))
         .def("queue_corporate_actions", &Engine::queue_corporate_actions, py::arg("events"))
         .def("begin_scenario", &Engine::begin_scenario, py::arg("scenario_id"))
         .def("begin_bar", &Engine::begin_bar, py::arg("snapshot"))
