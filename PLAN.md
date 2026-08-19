@@ -105,6 +105,7 @@ Severity is risk to trusting a P&L number.
 | B1 | **Stop and stop-limit orders silently execute as market orders.** `OrderType::Stop` and `StopLimit` are in the enum and bound to Python; the only price check in `execute_group` tests `OrderType::Limit` | `engine/engine.h:432` | Verified: a BUY STOP at $999 against a $5.00 market **fills immediately at $5.00**, no rejection. Any strategy using stops produces silently wrong results. Must reject explicitly. |
 | B2 | **Spread cost is uncalibrated.** The pipeline supplies no quotes, so the default `conditional_lognormal` parameters are illustrative | `engine/spread.h` defaults; `optionsdata` schema has no bid/ask | Confidence intervals describe an assumed distribution, not execution. The report says so, but a number that reads as ±$3 could be ±$300. |
 | B3 | **`on_fill` and `on_corporate_action` are declared in the Strategy API and never invoked** | `optionsbacktester/runner.py` — 0 call sites for either | A strategy cannot react to its own fills or to an adjustment. Any strategy written against the documented API silently never runs that logic. |
+| B4 | **`EquityKind::Equity` is bindable and silently ignored.** The execution path never branches on `Order::kind`; every order is priced with the contract's quote multiplier and booked as an option | `engine/engine.h` `execute_group` — no reference to `o.kind` | Verified: an EQUITY-flagged order for **1 share at $100 moved $10,000 and created an option position**, not a share position. A strategy attempting to trade stock gets a silent 100×-levered option trade. Worse than the feature being absent. |
 
 ### MAJOR
 
@@ -112,7 +113,7 @@ Severity is risk to trusting a P&L number.
 |---|---|---|---|
 | M1 | **Four of nine risk limits are declared but never enforced**: `max_contracts_per_underlying`, `max_notional_per_underlying`, `max_loss_per_trade`, `max_abs_delta` | zero references in `engine/engine.h` | Setting them has no effect. A risk-constrained backtest silently runs unconstrained. |
 | M2 | **`max_daily_loss` is actually a max *total* loss.** `day_start_equity_` is assigned once per scenario and never per session | `engine/engine.h:155` vs `:714` | The limit triggers on cumulative loss from initial cash, so a strategy that recovers is permanently halted. |
-| M3 | **A strategy cannot trade equity.** `EquityKind::Equity` appears nowhere in the execution path; shares arrive only via exercise or assignment | grep `EquityKind::Equity` in `engine.h` → no hits | No covered call from scratch, no protective put on existing shares, no collar, no synthetic, no delta hedging. `BACKTESTER_GOALS.md` names all of these as required. |
+| M3 | **No equity trading capability** (the coverage consequence of B4). Shares arrive only via exercise or assignment | — | No covered call from scratch, no protective put on existing shares, no collar, no synthetic, no delta hedging. `BACKTESTER_GOALS.md` names all of these as required. |
 | M4 | **A corporate-action basis transfer loses money to integer division.** `Money{basis.micros / child_qty}` truncates | `engine/engine.h` `transfer_position` | Verified: a 1→3 conversion on a $1,000.000001 basis loses **1 microdollar**. Tiny, but it violates "transfer total economic cost basis" and produces artificial P&L at an adjustment. |
 | M5 | **No early assignment.** Only expiration settles | `process_expirations`; `ConservativeEarlyAssignment` is an enum value with no distinct behavior | Short calls are never assigned before a dividend even when it is rational. Systematically flatters every short-call strategy, PMCC included. |
 | M6 | **Cash-settled index options are not representable.** Settlement is always physical; there is no European exercise path and no AM settlement value | `settle_physically` | SPX/VIX/XSP/RUT/NDX cannot be backtested. `SettlementRule::CashSettlement` is declared and unused. |
@@ -160,11 +161,15 @@ The cheapest and highest-value work: nothing here needs new data.
 - **M4.** Distribute the basis remainder across child contracts so the transfer
   is exact; assert basis conservation in a test.
 - **M8.** Assert monotonic time in `begin_bar`.
+- **B4.** Reject an `EquityKind::Equity` order outright until Phase 2 implements
+  it. A 100x-levered option trade in place of a share purchase is the worst
+  possible failure mode: it fills, it reconciles, and it is wrong.
 - **M12.** Either implement exercise orders or make `ExplicitExerciseOnly`
   unselectable.
 
 **Done when:** no declared feature silently does the wrong thing. Every enum
-value and config field either works or is rejected. A test exists for each.
+value and config field either works or is rejected. A test exists for each. The
+guiding rule: an unsupported feature must fail loudly, never approximate.
 
 ### Phase 1 — Make execution cost defensible  *(weeks, gated on the pipeline)*
 
