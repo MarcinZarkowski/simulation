@@ -1,40 +1,54 @@
-# Options Strategy Backtester — Claude Instructions
+# Options Backtester — Claude Instructions
 
-## Project Overview
+## Project
 
-This is an options strategy backtesting system. The core engine is a C++ Python extension (`backtest_engine.cpython-312-darwin.so`), wrapped by Python code and surfaced through a Streamlit dashboard.
+Deterministic options portfolio engine over the OptionsBackfill data lake. C++
+core (`engine/`, header-only plus pybind11) owns accounting and state
+transitions; Python (`optionsbacktester/`) owns data access, strategy logic, and
+reporting. See README.md for design rationale and limitations.
 
-## File Structure
-
-- `computation/` — Core simulation logic
-  - `cpp/` — C++ engine source (`backtest.cpp`, `position_management.cpp`, etc.) and `build.py`
-  - `backtest_builder.py` — Python wrapper encoding strategies for the C++ engine
-  - `config.py` — Central config for volatility windows and risk-free rates
-- `dashboard/` — Streamlit frontend
-  - `app.py` — Main entry point
-  - `tab_backtest.py` — Strategy builder and performance visualization
-
-## Build & Run
+## Build and test
 
 ```bash
-# Rebuild C++ extension after any changes to C++ source
-uv run computation/cpp/build.py
-
-# Run the dashboard
-streamlit run dashboard/app.py
+uv sync
+touch engine/bindings.cpp && uv run python engine/build.py   # see note below
+uv run python -m pytest tests/ -q
 ```
+
+**Always `touch engine/bindings.cpp` before rebuilding after editing a header.**
+setuptools tracks the `.cpp` timestamp and not header dependencies, so a header
+change alone is silently skipped and you will test a stale `.so`.
+
+## Invariants to preserve
+
+- **Money is int64 microdollars.** Never introduce a float into a cash, premium,
+  fee, cost-basis, or settlement path. `ledger_reconciles()` is an exact equality
+  and must stay one.
+- **Positions key on `contract_version_id`, never a symbol.** A symbol is an
+  attribute of a version.
+- **Only spread cost is stochastic.** If a test shows two Monte Carlo paths
+  differing in fill counts, expirations, or settlement, something other than the
+  spread became random and that is a bug.
+- **Draws stay counter-based.** Keep them a pure function of
+  `(seed, scenario, order, instrument, timestamp, leg)`. Introducing generator
+  state would make results depend on evaluation order.
+- **Fills never see their own bar.** Default timing is next-bar-open. Do not add a
+  fill rule that reads a high or low to infer a limit crossing.
+- **Fail closed on data quality and lineage.** Unconfirmed adjustments must refuse
+  the position rather than guess a quantity conversion.
+
+## Testing conventions
+
+- Orders submitted on bar N fill on bar N+1, so tests need an extra bar. Hold the
+  price constant across the fill bar when asserting an exact entry price.
+- Use `base_config(spread=E.SpreadModelKind.ZERO, fees=False)` for exact ledger
+  assertions; turn on exactly one of spread or fees when testing that component.
+- Assert exact money via `*_micros`, not `pytest.approx`, wherever a value is
+  exact.
+- Uncovered short calls are refused under `ROBINHOOD`; use `REG_T` when a test
+  needs one to fill.
 
 ## Permissions
 
-Claude has full read and write access to all files in this repository. You may:
-
-- Read, edit, and create any file under this directory
-- Run build commands (`uv run computation/cpp/build.py`)
-- Run the dashboard and tests
-- Modify C++ source, Python code, and configuration files without asking for confirmation
-
-## Development Notes
-
-- After editing any `.cpp` file, always rebuild the extension before testing
-- Use `uv` (not `pip`) for Python dependency management
-- The C++ engine is the performance-critical path; Python wrappers handle strategy encoding
+Full read and write access to this repository. Build, run, and test freely
+without asking. Do not push, switch branches, or create branches.
