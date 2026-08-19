@@ -438,3 +438,100 @@ class TestPerformanceReport:
         assert a.ending_equity == pytest.approx(
             a.starting_equity + a.ending_realized + a.ending_unrealized - fees,
             abs=0.02)
+
+
+class TestSpreadAbsoluteValues:
+    """
+    Absolute-value oracles for every spread model.
+
+    The audit's mutation run found exactly one survivor: doubling the
+    `/ 20000.0` conversion changed every fill's slippage and all 396 tests still
+    passed. The only ProportionalBps test asserted `rich == 10 * cheap`, and a
+    ratio check cannot see a constant factor. These pin the constants themselves.
+    """
+
+    @staticmethod
+    def _bare(kind) -> E.SpreadModelConfig:
+        """A config with every guard off, so the model's own arithmetic is visible."""
+        cfg = E.SpreadModelConfig()
+        cfg.kind = kind
+        cfg.round_to_tick = False
+        cfg.min_half_spread_cents = 0.0
+        cfg.max_fraction_of_mark = 1e9
+        cfg.log_sigma = 0.0
+        cfg.variance_scale = 0.0
+        return cfg
+
+    def test_constant_cents_is_half_the_configured_spread(self):
+        cfg = self._bare(E.SpreadModelKind.CONSTANT_CENTS)
+        cfg.constant_cents = 10.0
+        got = E.spread_draw(cfg, default_features(5.0), 1, 0, 1, 1, 0, 0)
+        assert got == pytest.approx(0.05)
+
+    @pytest.mark.parametrize(("bps", "mark", "expected_half"), [
+        (60.0, 5.00, 0.015),
+        (100.0, 10.00, 0.050),
+        (20.0, 1.00, 0.001),
+        (250.0, 4.00, 0.050),
+    ])
+    def test_proportional_bps_converts_exactly(self, bps, mark, expected_half):
+        """
+        A full spread of `bps` basis points of the mark, halved:
+        half = mark * bps / 20000. Pinning the constant, not just the ratio.
+        """
+        cfg = self._bare(E.SpreadModelKind.PROPORTIONAL_BPS)
+        cfg.proportional_bps = bps
+        got = E.spread_draw(cfg, default_features(mark), 1, 0, 1, 1, 0, 0)
+        assert got == pytest.approx(expected_half, rel=1e-9)
+
+    def test_lognormal_median_is_exp_log_base_in_basis_points(self):
+        cfg = self._bare(E.SpreadModelKind.LOGNORMAL)
+        cfg.log_base = math.log(80.0)
+        got = E.spread_draw(cfg, default_features(10.0), 1, 0, 1, 1, 0, 0)
+        assert got == pytest.approx(10.0 * 80.0 / 20000.0, rel=1e-9)
+
+    def test_conditional_median_at_the_reference_point_is_exp_log_base(self):
+        cfg = self._bare(E.SpreadModelKind.CONDITIONAL_LOGNORMAL)
+        cfg.log_base = math.log(45.0)
+        got = E.spread_draw(cfg, default_features(20.0), 1, 0, 1, 1, 0, 0)
+        assert got == pytest.approx(20.0 * 45.0 / 20000.0, rel=1e-9)
+
+    def test_empirical_returns_the_sampled_cents_exactly(self):
+        cfg = self._bare(E.SpreadModelKind.EMPIRICAL)
+        cfg.empirical_half_spread_cents = [2.5]
+        got = E.spread_draw(cfg, default_features(5.0), 1, 0, 1, 1, 0, 0)
+        assert got == pytest.approx(0.025)
+
+    def test_zero_model_costs_nothing(self):
+        cfg = self._bare(E.SpreadModelKind.ZERO)
+        assert E.spread_draw(cfg, default_features(5.0), 1, 0, 1, 1, 0, 0) == 0.0
+
+    def test_the_cap_binds_at_its_configured_fraction(self):
+        cfg = self._bare(E.SpreadModelKind.PROPORTIONAL_BPS)
+        cfg.proportional_bps = 100_000.0
+        cfg.max_fraction_of_mark = 0.25
+        got = E.spread_draw(cfg, default_features(8.0), 1, 0, 1, 1, 0, 0)
+        assert got == pytest.approx(8.0 * 0.25)
+
+
+class TestMoneyValidatesItsInput:
+    """
+    The only place the engine converts an unvalidated vendor float.
+
+    Returning zero on a non-finite input is the worst available outcome: a NaN
+    strike became strike 0, an always-in-the-money option whose cash-secured
+    requirement is also zero.
+    """
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_input_raises(self, bad):
+        with pytest.raises(ValueError):
+            E.Money.from_dollars(bad)
+
+    @pytest.mark.parametrize("bad", [9.3e12, -9.3e12])
+    def test_amounts_beyond_int64_microdollars_raise(self, bad):
+        with pytest.raises((OverflowError, IndexError, ValueError)):
+            E.Money.from_dollars(bad)
+
+    def test_representable_amounts_still_convert(self):
+        assert E.Money.from_dollars(1000.50).micros == 1_000_500_000

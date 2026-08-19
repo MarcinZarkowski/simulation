@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cmath>
 #include <limits>
+#include <stdexcept>
 #include <string>
 
 namespace obt {
@@ -22,11 +23,26 @@ struct Money {
 
     static Money zero() { return Money{0}; }
 
+    // Largest representable amount, and the point past which a double no longer
+    // has microdollar resolution.
+    static constexpr int64_t kMaxMicros = 9'223'372'036'854'775'807LL;
+
     // Nearest-microdollar conversion from a vendor price. Ties go away from
     // zero so a half-microdollar never depends on the sign.
+    //
+    // Throws on input it cannot represent rather than returning zero. Failing
+    // open here is the worst option available: a non-finite vendor price became
+    // $0.00, and a NaN strike became strike 0 -- an always-in-the-money option
+    // whose cash-secured requirement is also zero. This is the only place in the
+    // engine that converts an unvalidated vendor float.
     static Money from_double(double dollars) {
-        if (!std::isfinite(dollars)) return Money{0};
-        return Money{static_cast<int64_t>(std::llround(dollars * static_cast<double>(kPerDollar)))};
+        if (!std::isfinite(dollars))
+            throw std::invalid_argument("Money::from_double: value is not finite");
+        const double micros = dollars * static_cast<double>(kPerDollar);
+        if (micros > static_cast<double>(kMaxMicros)
+            || micros < -static_cast<double>(kMaxMicros))
+            throw std::out_of_range("Money::from_double: value exceeds int64 microdollars");
+        return Money{static_cast<int64_t>(std::llround(micros))};
     }
 
     static Money from_cents(int64_t cents) { return Money{cents * 10'000}; }
