@@ -52,6 +52,15 @@ struct FeeSchedule {
     Money exercise_fee{};
     Money assignment_fee{};
 
+    // Equity legs. Zero commission at Robinhood; the FINRA activity fee is
+    // $0.000195 per share sold, and Section 31 is not passed through on a sale of
+    // $500 or less.
+    Money equity_commission_per_share{};
+    Money equity_commission_per_trade{};
+    Money finra_taf_per_share = Money::from_double(0.000195);
+    int64_t finra_taf_min_shares = 50;
+    Money sec_fee_min_sale_notional = Money::from_double(500.0);
+
     std::string schedule_id = "robinhood_equity_options_2026_04";
 
     // Robinhood's index-option schedule, which is a different animal: a real
@@ -91,12 +100,35 @@ struct FeeSchedule {
         return total;
     }
 
+    // Fees on one equity trade. The rates differ from the option side: the FINRA
+    // activity fee is per SHARE, there is no per-contract regulatory pass-through,
+    // and Section 31 is not passed through on a sale of $500 or less.
+    Money equity_fees(OrderSide side, int64_t shares, Money notional) const {
+        Money total = equity_commission_per_trade
+                    + scale(Money{shares}, equity_commission_per_share.to_double());
+        if (side == OrderSide::Sell || !sec_fee_on_sells_only) {
+            if (notional.abs() > sec_fee_min_sale_notional) {
+                const Money raw = scale(notional.abs(), sec_fee_rate_per_dollar);
+                const int64_t cent = 10'000;
+                total += Money{((raw.micros + cent - 1) / cent) * cent};
+            }
+            // FINRA excludes a sale of 50 shares or fewer.
+            if (shares > finra_taf_min_shares)
+                total += drop_sub_cent(
+                    min_money(finra_taf_per_share * shares, finra_taf_cap_per_trade));
+        }
+        return total;
+    }
+
     static FeeSchedule zero() {
         FeeSchedule f;
         f.sec_fee_rate_per_dollar = 0.0;
         f.finra_taf_per_contract = Money::zero();
         f.regulatory_per_contract = Money::zero();
         f.cat_per_contract = Money::zero();
+        f.equity_commission_per_share = Money::zero();
+        f.equity_commission_per_trade = Money::zero();
+        f.finra_taf_per_share = Money::zero();
         f.schedule_id = "zero_fees";
         return f;
     }

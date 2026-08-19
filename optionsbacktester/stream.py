@@ -32,8 +32,12 @@ OPTION_COLUMNS = [
     "smoothed_iv", "delta", "gamma", "theta", "vega", "rho", "theoretical_value",
 ]
 
+# vwap and trade_count are written by the pipeline and were not read. A strategy
+# trading shares needs them for the same reasons the option side does: a
+# consistent mark, and a way to tell a real bar from a printless one.
 STOCK_COLUMNS = ["timestamp", "underlying_open", "underlying_high", "underlying_low",
-                 "underlying_close", "underlying_volume"]
+                 "underlying_close", "underlying_vwap", "underlying_volume",
+                 "underlying_trade_count"]
 
 SUCCESS_MARKER = "_SUCCESS"
 

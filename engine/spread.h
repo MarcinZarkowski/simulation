@@ -136,6 +136,17 @@ struct SpreadModelConfig {
     // Empirical: sampled half-spreads in cents, drawn uniformly.
     std::vector<double> empirical_half_spread_cents;
 
+    // Equity legs. A share quote is a different animal from an option quote: the
+    // grid is a penny at every price, there is no expiry or implied volatility to
+    // condition on, and a liquid name trades a penny wide -- which on a $100 stock
+    // is one basis point of full spread, two orders of magnitude tighter than the
+    // 55 bps the option model centres on. Pricing shares through the option model
+    // would have charged a covered call more to buy its stock than to sell its
+    // call.
+    double equity_full_spread_bps = 1.0;
+    double equity_log_sigma = 0.35;
+    double equity_min_half_spread_cents = 0.5;
+
     // Guards. A real quote is never tighter than a tick and a spread wider than
     // the option is worth would let a fill go through zero.
     double min_half_spread_cents = 0.5;
@@ -229,6 +240,45 @@ inline double half_spread_dollars(
     if (cfg.round_to_tick && floor_dollars > 0.0) {
         floor_dollars = std::ceil(2.0 * floor_dollars / tick) * tick / 2.0;
     }
+    return std::max(half, floor_dollars);
+}
+
+// Half of the bid/ask spread on an equity leg, in dollars per share.
+//
+// Drawn through the same counter-based generator as the option spread, so an
+// equity fill participates in the Monte Carlo and stays a pure function of
+// (seed, scenario, order, instrument, timestamp, leg) rather than depending on
+// evaluation order. The share grid is a penny at every price, so the half-spread
+// lands on a half-cent.
+inline double equity_half_spread_dollars(
+    const SpreadModelConfig& cfg, double price_dollars, const DrawKey& key)
+{
+    if (cfg.kind == SpreadModelKind::Zero || price_dollars <= 0.0) return 0.0;
+
+    double half = price_dollars * cfg.equity_full_spread_bps / 20000.0;
+    const bool stochastic = cfg.kind == SpreadModelKind::Lognormal
+                         || cfg.kind == SpreadModelKind::ConditionalLognormal;
+    if (stochastic) {
+        const double sigma = cfg.equity_log_sigma
+            * (cfg.variance_scale < 0.0 ? 0.0 : cfg.variance_scale);
+        // Same mean-preserving correction as the option path, so scaling the
+        // variance moves dispersion without moving the expected cost.
+        double mu = std::log(std::max(half, 1e-12));
+        if (cfg.preserve_mean_under_variance_scale)
+            mu += 0.5 * (cfg.equity_log_sigma * cfg.equity_log_sigma - sigma * sigma);
+        half = std::exp(mu + sigma * standard_normal(key));
+    }
+
+    half = std::min(half, price_dollars * cfg.max_fraction_of_mark);
+    half = std::max(half, 0.0);
+
+    constexpr double kEquityTick = 0.01;
+    if (cfg.round_to_tick && half > 0.0)
+        half = std::round(2.0 * half / kEquityTick) * kEquityTick / 2.0;
+
+    double floor_dollars = cfg.equity_min_half_spread_cents / 100.0;
+    if (cfg.round_to_tick && floor_dollars > 0.0)
+        floor_dollars = std::ceil(2.0 * floor_dollars / kEquityTick) * kEquityTick / 2.0;
     return std::max(half, floor_dollars);
 }
 

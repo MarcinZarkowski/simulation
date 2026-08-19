@@ -201,6 +201,42 @@ def sell(cv: int, qty: int = 1, **kw) -> E.Order:
     return leg(cv, E.OrderSide.SELL, qty, **kw)
 
 
+def shares(
+    symbol: str,
+    side: E.OrderSide,
+    quantity: int,
+    *,
+    limit_price: float | None = None,
+    reduce_only: bool = False,
+    tag: str = "",
+) -> E.Order:
+    """
+    An equity leg. Identifies its instrument by symbol, not by contract version.
+
+    Shares used to arrive only via assignment, so a covered call or a collar could
+    not be opened at all -- only inherited from an option that settled.
+    """
+    o = E.Order()
+    o.kind = E.EquityKind.EQUITY
+    o.symbol = symbol
+    o.side = side
+    o.quantity = quantity
+    o.type = E.OrderType.LIMIT if limit_price is not None else E.OrderType.MARKET
+    if limit_price is not None:
+        o.limit_price = limit_price
+    o.reduce_only = reduce_only
+    o.tag = tag
+    return o
+
+
+def buy_shares(symbol: str, quantity: int, **kw) -> E.Order:
+    return shares(symbol, E.OrderSide.BUY, quantity, **kw)
+
+
+def sell_shares(symbol: str, quantity: int, **kw) -> E.Order:
+    return shares(symbol, E.OrderSide.SELL, quantity, **kw)
+
+
 def group(*legs: E.Order, group_id: int | None = None) -> E.OrderGroup:
     """
     Bundle legs into one atomic order.

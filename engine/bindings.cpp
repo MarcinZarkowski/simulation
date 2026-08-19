@@ -263,6 +263,7 @@ PYBIND11_MODULE(obt_engine, m) {
             [](const Order& o) { return o.contract_version_id.value; },
             [](Order& o, uint64_t v) { o.contract_version_id = ContractVersionId{v}; })
         .def_readwrite("kind", &Order::kind)
+        .def_readwrite("symbol", &Order::symbol)
         .def_readwrite("quantity", &Order::quantity)
         .def_readwrite("side", &Order::side)
         .def_readwrite("type", &Order::type)
@@ -307,6 +308,7 @@ PYBIND11_MODULE(obt_engine, m) {
         .def_property_readonly("fill_price", [](const Fill& f) { return f.fill_price.to_double(); })
         .def_property_readonly("half_spread", [](const Fill& f) { return f.half_spread.to_double(); })
         .def_property_readonly("gross_cash", [](const Fill& f) { return f.gross_cash.to_double(); })
+        .def_readonly("kind", &Fill::kind)
         .def_property_readonly("fees", [](const Fill& f) { return f.fees.to_double(); })
         .def_property_readonly("fees_micros", [](const Fill& f) { return f.fees.micros; })
         .def_property_readonly("net_cash", [](const Fill& f) { return f.net_cash.to_double(); })
@@ -364,6 +366,10 @@ PYBIND11_MODULE(obt_engine, m) {
         .def_readwrite("ref_days_to_expiry", &SpreadModelConfig::ref_days_to_expiry)
         .def_readwrite("ref_volume", &SpreadModelConfig::ref_volume)
         .def_readwrite("variance_scale", &SpreadModelConfig::variance_scale)
+        .def_readwrite("equity_full_spread_bps", &SpreadModelConfig::equity_full_spread_bps)
+        .def_readwrite("equity_log_sigma", &SpreadModelConfig::equity_log_sigma)
+        .def_readwrite("equity_min_half_spread_cents",
+                       &SpreadModelConfig::equity_min_half_spread_cents)
         .def_readwrite("preserve_mean_under_variance_scale",
                        &SpreadModelConfig::preserve_mean_under_variance_scale)
         .def("effective_sigma", &SpreadModelConfig::effective_sigma)
@@ -382,6 +388,16 @@ PYBIND11_MODULE(obt_engine, m) {
         .def_static("zero", &FeeSchedule::zero)
         .def_static("robinhood_index_options", &FeeSchedule::robinhood_index_options,
                     py::arg("gold") = false)
+        .def("equity_fees", [](const FeeSchedule& f, OrderSide side, int64_t shares,
+                               double notional) {
+            return f.equity_fees(side, shares, money_from(notional)).to_double();
+        }, py::arg("side"), py::arg("shares"), py::arg("notional"))
+        .def_property("equity_commission_per_share",
+            [](const FeeSchedule& f) { return f.equity_commission_per_share.to_double(); },
+            [](FeeSchedule& f, double v) { f.equity_commission_per_share = money_from(v); })
+        .def_property("finra_taf_per_share",
+            [](const FeeSchedule& f) { return f.finra_taf_per_share.to_double(); },
+            [](FeeSchedule& f, double v) { f.finra_taf_per_share = money_from(v); })
         .def_property("commission_per_contract",
             [](const FeeSchedule& f) { return f.commission_per_contract.to_double(); },
             [](FeeSchedule& f, double v) { f.commission_per_contract = money_from(v); })
@@ -573,6 +589,26 @@ PYBIND11_MODULE(obt_engine, m) {
             [](DividendEvent& d, int64_t v) { d.pay_date = Timestamp{v}; })
         .def_property_readonly("event_id", &DividendEvent::event_id);
 
+    py::class_<EquityBar>(m, "EquityBar")
+        .def(py::init<>())
+        .def_property("timestamp",
+            [](const EquityBar& b) { return b.timestamp.epoch_ns; },
+            [](EquityBar& b, int64_t v) { b.timestamp = Timestamp{v}; })
+        .def_readwrite("symbol", &EquityBar::symbol)
+        .def_property("open", [](const EquityBar& b) { return b.open.to_double(); },
+                      [](EquityBar& b, double v) { b.open = money_from(v); })
+        .def_property("high", [](const EquityBar& b) { return b.high.to_double(); },
+                      [](EquityBar& b, double v) { b.high = money_from(v); })
+        .def_property("low", [](const EquityBar& b) { return b.low.to_double(); },
+                      [](EquityBar& b, double v) { b.low = money_from(v); })
+        .def_property("close", [](const EquityBar& b) { return b.close.to_double(); },
+                      [](EquityBar& b, double v) { b.close = money_from(v); })
+        .def_property("vwap", [](const EquityBar& b) { return b.vwap.to_double(); },
+                      [](EquityBar& b, double v) { b.vwap = money_from(v); })
+        .def_readwrite("volume", &EquityBar::volume)
+        .def_readwrite("trade_count", &EquityBar::trade_count)
+        .def_readwrite("stale", &EquityBar::stale);
+
     py::class_<MarketSnapshot>(m, "MarketSnapshot")
         .def(py::init<>())
         .def_property("timestamp",
@@ -580,6 +616,7 @@ PYBIND11_MODULE(obt_engine, m) {
             [](MarketSnapshot& s, int64_t v) { s.timestamp = Timestamp{v}; })
         .def_readwrite("bars", &MarketSnapshot::bars)
         .def_readwrite("analytics", &MarketSnapshot::analytics)
+        .def_readwrite("equity_bars", &MarketSnapshot::equity_bars)
         .def_property("underlying_price",
             [](const MarketSnapshot& s) {
                 std::unordered_map<std::string, double> out;

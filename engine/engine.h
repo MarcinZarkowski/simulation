@@ -191,6 +191,9 @@ struct MarketSnapshot {
     std::vector<MarketBar> bars;
     std::vector<OptionAnalytics> analytics;
     std::unordered_map<std::string, Money> underlying_price;
+    // Share bars, for strategies that trade the underlying directly. Shares used
+    // to arrive only via assignment, so a covered call could not be opened at all.
+    std::vector<EquityBar> equity_bars;
     // Official settlement values, keyed by underlying. A cash-settled index series
     // settles against a published number (SET for SPX, VRO for VIX) computed from
     // opening or closing prints, not against the last bar anyone happened to see.
@@ -406,6 +409,8 @@ private:
         bar_index_.clear();
         analytics_index_.clear();
         for (const MarketBar& b : current_.bars) bar_index_[b.contract_version_id.value] = &b;
+        equity_bar_index_.clear();
+        for (const EquityBar& b : current_.equity_bars) equity_bar_index_[b.symbol] = &b;
         for (const OptionAnalytics& a : current_.analytics)
             analytics_index_[a.contract_version_id.value] = &a;
     }
@@ -594,10 +599,100 @@ private:
 
     // Validates every leg, then commits all of them or none. A broker does not
     // partially execute a spread, so neither does this.
+    // Plans one equity leg. Shares have no contract version, no analytics, and a
+    // multiplier of one -- the kind flag used to be accepted and ignored, so an
+    // order for a single share was priced with the contract's 100x multiplier and
+    // booked as an option.
+    template <typename PlannedT>
+    bool plan_equity_leg(const Order& o, bool use_open, uint32_t leg_index,
+                         PlannedT& p, RejectReason* reason, std::string* detail)
+    {
+        p.is_equity = true;
+        p.multiplier = 1;
+        if (o.symbol.empty()) {
+            *reason = RejectReason::UnsupportedInstrumentKind;
+            *detail = "an equity order must name its symbol";
+            return false;
+        }
+        auto it = equity_bar_index_.find(o.symbol);
+        if (it == equity_bar_index_.end()) {
+            *reason = RejectReason::NoMarketData;
+            *detail = "no equity bar at fill time";
+            return false;
+        }
+        const EquityBar& bar = *it->second;
+        if (cfg_.reject_stale_bars && bar.stale) {
+            *reason = RejectReason::StaleMarketData;
+            *detail = "stale equity bar";
+            return false;
+        }
+        p.mark = bar.execution_price(use_open);
+        if (p.mark.micros <= 0) {
+            *reason = RejectReason::NoMarketData;
+            *detail = "non-positive equity price";
+            return false;
+        }
+
+        // Keyed on the symbol so an equity draw is independent of any option draw
+        // and still a pure function of the order.
+        DrawKey key{cfg_.spread_mc_seed, scenario_id_, o.order_id,
+                    hash_key(o.symbol), now_.epoch_ns, leg_index};
+        p.half_spread = Money::from_double(
+            equity_half_spread_dollars(cfg_.spread_model, p.mark.to_double(), key));
+        p.fill_price = (o.side == OrderSide::Buy) ? p.mark + p.half_spread
+                                                  : p.mark - p.half_spread;
+        if (p.fill_price.micros < 0) p.fill_price = Money::zero();
+
+        if (o.type == OrderType::Limit && o.limit_price.has_value()) {
+            const bool ok = (o.side == OrderSide::Buy) ? p.fill_price <= *o.limit_price
+                                                       : p.fill_price >= *o.limit_price;
+            if (!ok) {
+                *reason = RejectReason::LimitNotSatisfied;
+                *detail = "limit not satisfied at execution price";
+                return false;
+            }
+        }
+
+        const int64_t signed_qty = (o.side == OrderSide::Buy) ? o.quantity : -o.quantity;
+        p.gross_cash = Money{-p.fill_price.micros * signed_qty};
+        p.fees = cfg_.fees.equity_fees(
+            o.side, o.quantity, Money{p.fill_price.micros * o.quantity});
+        return true;
+    }
+
+    template <typename PlannedT>
+    void apply_equity_fill(const PlannedT& p, uint64_t group_id, int64_t signed_qty) {
+        book_.apply_equity(p.order.symbol, signed_qty, p.fill_price);
+        ledger_.post(now_, LedgerEntryKind::EquityTrade, p.gross_cash,
+                     ContractVersionId{}, p.order.order_id, p.order.symbol);
+        ledger_.post(now_, LedgerEntryKind::Fee, -p.fees, ContractVersionId{},
+                     p.order.order_id, cfg_.fees.schedule_id);
+
+        Fill f;
+        f.order_id = p.order.order_id;
+        f.group_id = group_id;
+        f.filled_at = now_;
+        f.kind = EquityKind::Equity;
+        f.side = p.order.side;
+        f.quantity = p.order.quantity;
+        f.mark = p.mark;
+        f.fill_price = p.fill_price;
+        f.half_spread = p.half_spread;
+        f.multiplier = 1;
+        f.gross_cash = p.gross_cash;
+        f.fees = p.fees;
+        f.net_cash = p.gross_cash - p.fees;
+        fills_.push_back(f);
+
+        metrics_.fill_count++;
+        metrics_.spread_cost += f.spread_cost();
+    }
+
     void execute_group(OrderGroup& group, bool use_open) {
         struct Planned {
             Order order;
             const OptionContractVersion* contract = nullptr;
+            bool is_equity = false;
             Money mark{};
             Money half_spread{};
             Money fill_price{};
@@ -626,13 +721,11 @@ private:
                 detail = "stop triggers cannot be simulated from bar data; use a limit";
                 break;
             }
-            // Equity legs are not implemented. The kind flag was accepted and
-            // ignored, so an order for one share was priced with the contract's
-            // 100x multiplier and booked as an option.
-            if (o.kind != EquityKind::Option) {
-                reason = RejectReason::UnsupportedInstrumentKind;
-                detail = "equity orders are not implemented; shares arrive only via settlement";
-                break;
+            if (o.kind == EquityKind::Equity) {
+                if (!plan_equity_leg(o, use_open, leg_index, p, &reason, &detail)) break;
+                plan.push_back(p);
+                leg_index++;
+                continue;
             }
 
             p.contract = registry().find(o.contract_version_id);
@@ -721,8 +814,9 @@ private:
                 for (const Planned& p : plan) {
                     const int64_t q = (p.order.side == OrderSide::Buy) ? p.order.quantity
                                                                        : -p.order.quantity;
-                    probe.apply(p.order.contract_version_id, EquityKind::Option, q,
-                                p.fill_price, p.multiplier, now_);
+                    if (p.is_equity) probe.apply_equity(p.order.symbol, q, p.fill_price);
+                    else probe.apply(p.order.contract_version_id, EquityKind::Option, q,
+                                     p.fill_price, p.multiplier, now_);
                 }
             }, plan, &reason, &detail)) {
             reject_group(group, reason, detail);
@@ -732,6 +826,10 @@ private:
         for (const Planned& p : plan) {
             const int64_t signed_qty = (p.order.side == OrderSide::Buy) ? p.order.quantity
                                                                         : -p.order.quantity;
+            if (p.is_equity) {
+                apply_equity_fill(p, group.group_id, signed_qty);
+                continue;
+            }
             // Capture the pre-trade state so a close can be recorded with the
             // entry price it is closing against.
             const Position* existing = book_.find(p.order.contract_version_id);
@@ -1286,6 +1384,7 @@ private:
 
     MarketSnapshot current_;
     std::unordered_map<uint64_t, const MarketBar*> bar_index_;
+    std::unordered_map<std::string, const EquityBar*> equity_bar_index_;
     std::unordered_map<uint64_t, const OptionAnalytics*> analytics_index_;
     std::unordered_map<uint64_t, Money> last_mark_;
     std::unordered_map<std::string, Money> last_underlying_;

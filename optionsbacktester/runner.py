@@ -313,8 +313,13 @@ def _run_day(
             scenario_id=i,
         ))
 
+    stock_by_time = (
+        {t: f for t, f in day.stock.partition_by("timestamp", as_dict=True).items()}
+        if not day.stock.is_empty() else {}
+    )
     for ts, batch in iter_timestamp_batches(day):
-        snapshot = build_snapshot(ts, batch, contracts, ticker)
+        snapshot = build_snapshot(ts, batch, contracts, ticker,
+                                  stock_by_time.get((ts,)))
         chain = chain_from_batch(batch, contracts, _row_key)
 
         for i, (engine, strategy) in enumerate(zip(engines, strategies, strict=True)):

@@ -235,17 +235,49 @@ def build_analytics(batch: pl.DataFrame, contracts: dict[int, E.OptionContractVe
     return out
 
 
+def build_equity_bars(stock: pl.DataFrame, underlying_symbol: str) -> list[E.EquityBar]:
+    """
+    Share bars for one timestamp, from the pipeline's stock frame.
+
+    The frame was loaded into ``DaySlice`` and used only to join an underlying price
+    onto the option rows, so its open, high, low and volume never reached the
+    engine and an equity order had no price to execute against.
+    """
+    if stock.is_empty():
+        return []
+    out: list[E.EquityBar] = []
+    for row in stock.iter_rows(named=True):
+        b = E.EquityBar()
+        b.timestamp = to_ns(row["timestamp"])
+        b.symbol = underlying_symbol
+        close = _float(row, "underlying_close", 0.0)
+        b.close = close
+        # An absent open means the bar carried only a close. Falling back keeps the
+        # bar usable rather than producing a zero price that would be refused.
+        b.open = _float(row, "underlying_open", close)
+        b.high = _float(row, "underlying_high", close)
+        b.low = _float(row, "underlying_low", close)
+        b.vwap = _float(row, "underlying_vwap", close)
+        b.volume = int(row.get("underlying_volume") or 0)
+        b.trade_count = int(row.get("underlying_trade_count") or 0)
+        out.append(b)
+    return out
+
+
 def build_snapshot(
     timestamp: datetime,
     batch: pl.DataFrame,
     contracts: dict[int, E.OptionContractVersion],
     underlying_symbol: str,
+    stock: pl.DataFrame | None = None,
 ) -> E.MarketSnapshot:
     """A full point-in-time snapshot for the engine."""
     snap = E.MarketSnapshot()
     snap.timestamp = to_ns(timestamp)
     snap.bars = build_bars(batch, contracts)
     snap.analytics = build_analytics(batch, contracts)
+    if stock is not None:
+        snap.equity_bars = build_equity_bars(stock, underlying_symbol)
 
     price = None
     if "underlying_price" in batch.columns:

@@ -18,6 +18,7 @@ from optionsbacktester.contracts import (
 )
 from optionsbacktester.stream import (
     OPTION_COLUMNS,
+    STOCK_COLUMNS,
     SUCCESS_MARKER,
     DataLake,
     UniverseFilter,
@@ -171,8 +172,7 @@ class TestColumnProjection:
     def test_the_stock_frame_is_projected_to_the_underlying_columns(self, tmp_lake):
         day = only_day(small_lake(tmp_lake))
 
-        assert day.stock.columns == ["timestamp", "underlying_open", "underlying_high",
-                                     "underlying_low", "underlying_close", "underlying_volume"]
+        assert day.stock.columns == STOCK_COLUMNS
 
 
 class TestDerivedColumns:

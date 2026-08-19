@@ -520,11 +520,12 @@ class TestUnsupportedFeaturesRefuse:
         assert len(h.fills()) == 0
         assert reasons(h) == [E.RejectReason.UNSUPPORTED_ORDER_TYPE]
 
-    def test_equity_orders_are_refused_rather_than_booked_as_options(self, engine):
+    def test_an_equity_order_without_a_symbol_is_refused(self, engine):
         """
-        The kind flag was accepted and ignored, so an order for one share was
-        priced with the contract's 100x multiplier: 1 share at $100 moved $10,000
-        and created an option position.
+        An equity leg identifies its instrument by symbol, not by contract version.
+        The kind flag used to be accepted and ignored entirely, so an order for one
+        share was priced with the contract's 100x multiplier: 1 share at $100 moved
+        $10,000 and created an option position.
         """
         h = engine()
         o = buy(CALL_100)

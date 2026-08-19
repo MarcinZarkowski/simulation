@@ -48,6 +48,9 @@ struct Order {
     Timestamp submitted_at{};
     ContractVersionId contract_version_id{};
     EquityKind kind = EquityKind::Option;
+    // The share symbol, for an equity leg. Ignored for an option leg, which
+    // identifies its instrument by contract version.
+    std::string symbol;
 
     // Always positive; direction comes from side.
     int64_t quantity = 0;

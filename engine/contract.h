@@ -162,6 +162,25 @@ struct MarketBar {
     bool analytics_valid = false;
 };
 
+// Point-in-time bar for a share. Separate from MarketBar because a share has no
+// contract version, no analytics validity, and a penny grid at every price.
+struct EquityBar {
+    Timestamp timestamp{};
+    std::string symbol;
+    Money open{}, high{}, low{}, close{}, vwap{};
+    int64_t volume = 0;
+    int64_t trade_count = 0;
+    bool stale = false;
+
+    // The price an order executes against. Next-bar-open timing reads the open;
+    // same-bar-close reads the close. VWAP is not used, because a fill at the
+    // period's volume-weighted average is a price no single order could have got.
+    Money execution_price(bool use_open) const {
+        const Money chosen = use_open ? open : close;
+        return chosen.micros > 0 ? chosen : close;
+    }
+};
+
 // Analytics for one contract at one timestamp. Every field is advisory: the
 // engine gates on the validity flags before letting a strategy see them.
 struct OptionAnalytics {
