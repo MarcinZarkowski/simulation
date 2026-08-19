@@ -11,6 +11,21 @@ predecessor that never read an option price; this plan covers what remains.
 Carlo simulated rather than reconstructed, and why the honesty of that
 simulation is the single most important open item.
 
+### Dependency on the pipeline
+
+Two phases here cannot start until the pipeline delivers:
+
+| Needs from `../optionsdata/PLAN.md` | Blocks |
+|---|---|
+| Phase 1 — quote sampler and spread calibration artifact | **B2**, and all of Phase 1 |
+| Phase 2 — OCC memo ingestion, confirmed lineage | Carrying a position through an adjustment |
+| Phase 1 — exercise style and settlement type columns | **M6**, index and cash-settled options |
+| Phase 1 — declared dividends with declaration dates *(already produced)* | **M5**, early assignment |
+
+Phase 0 below is entirely independent of the pipeline and is the highest
+value-per-hour work in either repo: it removes silent wrongness using only code
+already here.
+
 ---
 
 ## 1. Where this stands today
