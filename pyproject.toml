@@ -1,20 +1,31 @@
 [project]
 name = "simulator"
 version = "0.1.0"
-description = "Add your description here"
+description = "Options portfolio backtester over the OptionsBackfill data lake"
 readme = "README.md"
 requires-python = ">=3.12"
+# What the maintained package actually imports. The previous set declared
+# streamlit, plotly, yfinance, pandas, numpy, scipy, platformdirs and pyarrow --
+# none of which optionsbacktester/, engine/ or tests/ import. They belong to
+# computation/ and dashboard/, the previous implementation, which is still present
+# and declared as an optional extra rather than a required dependency of the
+# backtester.
 dependencies = [
+    "polars>=1.43.2",
+    "pybind11>=3.0.4",
+]
+
+[project.optional-dependencies]
+# The predecessor Streamlit dashboard and its yfinance-backed daily-bar
+# computation. Left in the repo deliberately; removing it is a decision, not a
+# cleanup.
+legacy-dashboard = [
     "streamlit>=1.30",
     "plotly>=5.18",
     "yfinance>=0.2",
-    "numpy>=1.26",
     "pandas>=2.1",
-    "platformdirs>=4.0",
-    "pybind11>=3.0.4",
+    "numpy>=1.26",
     "scipy>=1.17.1",
-    "polars>=1.43.2",
-    "pyarrow>=24.0.0",
 ]
 
 [dependency-groups]

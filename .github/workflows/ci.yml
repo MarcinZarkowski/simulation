@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync
+
+      # setuptools tracks the .cpp timestamp and not header dependencies, so a
+      # header-only change is silently skipped and a stale extension ships. A clean
+      # checkout has no build/ directory, but touching costs nothing and keeps this
+      # step identical to the documented local command.
+      - name: Build the extension
+        run: |
+          touch engine/bindings.cpp
+          uv run python engine/build.py
+
+      - name: Test
+        run: uv run python -m pytest tests/ -q
+
+      # Ceilings, not measurements. They exist so a regression that doubles memory
+      # or halves throughput fails here rather than being discovered on a real run.
+      - name: Performance and memory ceilings
+        run: uv run python scripts/check_budgets.py

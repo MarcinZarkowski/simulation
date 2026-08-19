@@ -3,3 +3,8 @@ __pycache__/
 *.pyc
 .venv/
 data/
+# Built extensions. Two arm64 .so files were tracked, so a checkout on any other
+# architecture got a binary it could not load, and a stale one could shadow a
+# rebuild. They are build output; engine/build.py produces them.
+*.so
+build/

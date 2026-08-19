@@ -70,6 +70,11 @@ class RunManifest:
     initial_cash: float
     data_sha256: str = ""
     day_count: int = 0
+    # Bars and option rows actually processed. A run that does not record its own
+    # size cannot be compared against another, and a run that silently covered a
+    # tenth of its range looks identical to one that covered all of it.
+    bar_count: int = 0
+    option_row_count: int = 0
     config_sha256: str = ""
     platform: str = field(default_factory=lambda: f"{platform.system()}-{platform.machine()}")
 
@@ -207,6 +212,8 @@ def run(
     engines.append(reference_engine)
     strategies.append(strategy_factory())
 
+    bar_count = 0
+    option_row_count = 0
     contracts: dict[int, E.OptionContractVersion] = {}
     # One registry, shared by every engine and grown in place. Each engine used to
     # hold its own copy, re-set from the full cumulative set once per day, so both
@@ -241,7 +248,9 @@ def run(
             for engine in engines:
                 engine.queue_corporate_actions(transitions)
 
-        _run_day(day, engines, strategies, contracts, ticker)
+        bars, rows = _run_day(day, engines, strategies, contracts, ticker)
+        bar_count += bars
+        option_row_count += rows
 
     all_results = [engine.finalize() for engine in engines]
     # The reference engine is the last one; it is not a Monte Carlo path.
@@ -260,6 +269,8 @@ def run(
         execution_timing=str(config.execution_timing).rsplit(".", 1)[-1].lower(),
         assignment_policy=E.assignment_policy_name(config.assignment_policy),
         margin_model=str(config.margin_model).rsplit(".", 1)[-1].lower(),
+        bar_count=bar_count,
+        option_row_count=option_row_count,
         fee_schedule=config.fees.schedule_id,
         initial_cash=config.initial_cash,
         data_sha256=_hash_files(files_read) if hash_data else "",
@@ -284,7 +295,8 @@ def _run_day(
     strategies: list[Strategy],
     contracts: dict[int, E.OptionContractVersion],
     ticker: str,
-) -> None:
+) -> tuple[int, int]:
+    """Runs one session across every engine. Returns (bars, option rows) processed."""
     """
     One trading day, following the spec's required ordering per timestamp.
 
@@ -317,7 +329,11 @@ def _run_day(
         {t: f for t, f in day.stock.partition_by("timestamp", as_dict=True).items()}
         if not day.stock.is_empty() else {}
     )
+    bar_count = 0
+    option_row_count = 0
     for ts, batch in iter_timestamp_batches(day):
+        bar_count += 1
+        option_row_count += batch.height
         snapshot = build_snapshot(ts, batch, contracts, ticker,
                                   stock_by_time.get((ts,)))
         chain = chain_from_batch(batch, contracts, _row_key)
@@ -363,3 +379,5 @@ def _run_day(
             session_day=session_day,
             scenario_id=i,
         ))
+
+    return bar_count, option_row_count
