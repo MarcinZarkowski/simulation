@@ -366,7 +366,12 @@ class TestCliWorkflow:
         assert payload["manifest"]["spread_mc_seed"] == 5
         assert payload["manifest"]["execution_timing"] == "next_bar_open"
         assert len(payload["manifest"]["data_sha256"]) == 64
-        assert payload["report"]["ledger_reconciles"] is True
+        assert payload["monte_carlo"]["ledger_reconciles"] is True
+        # Account and trade sections describe one representative path, and the
+        # deterministic figure comes from a real zero-spread run.
+        assert "ending_equity" in payload["account"]
+        assert "median" in payload["trades"]
+        assert "deterministic_net_pnl" in payload["monte_carlo"]
 
     def test_unknown_calibration_key_is_rejected(self, tmp_path):
         from optionsbacktester.cli import main
