@@ -100,8 +100,21 @@ struct SpreadModelConfig {
     double proportional_bps = 60.0;
 
     // Lognormal / ConditionalLognormal, in log-basis-point space.
-    double log_base = 4.0;          // exp(4.0) ~ 55 bps at the reference point
+    //
+    // log_base is the log of the median full spread in basis points AT THE
+    // REFERENCE POINT below. The conditional terms are deviations from that
+    // reference, so this constant is directly interpretable and the documented
+    // magnitude is true by construction. Previously the betas were absolute, so
+    // log_base = 4.0 was documented as ~55 bps while actually producing 13 bps at
+    // any realistic volume -- which the min-spread floor then clamped away
+    // entirely, collapsing the whole Monte Carlo onto a single value.
+    double log_base = 4.007;        // exp(4.007) = 55 bps at the reference point
     double log_sigma = 0.45;
+
+    // Reference point the conditional betas are measured against.
+    double ref_implied_volatility = 0.15;
+    double ref_days_to_expiry = 30.0;
+    double ref_volume = 5000.0;
 
     // Scales the dispersion of the drawn spread without touching its central
     // tendency. 1.0 leaves the model as calibrated; 2.0 doubles the log-space
@@ -175,9 +188,11 @@ inline double half_spread_dollars(
 
         case SpreadModelKind::ConditionalLognormal: {
             const double mu = cfg.log_base
-                + cfg.beta_iv * f.implied_volatility
-                + cfg.beta_log_dte * std::log1p(std::max(0.0, f.days_to_expiry))
-                + cfg.beta_log_volume * std::log1p(std::max(0.0, f.volume))
+                + cfg.beta_iv * (f.implied_volatility - cfg.ref_implied_volatility)
+                + cfg.beta_log_dte * (std::log1p(std::max(0.0, f.days_to_expiry))
+                                      - std::log1p(cfg.ref_days_to_expiry))
+                + cfg.beta_log_volume * (std::log1p(std::max(0.0, f.volume))
+                                         - std::log1p(cfg.ref_volume))
                 + cfg.beta_abs_moneyness * std::fabs(f.moneyness)
                 + cfg.beta_minutes_from_open * f.minutes_from_open;
             const double sigma = cfg.effective_sigma();
@@ -196,16 +211,25 @@ inline double half_spread_dollars(
         }
     }
 
-    half = std::max(half, cfg.min_half_spread_cents / 100.0);
+    // Cap first, then quantize to the quote grid, then enforce the floor. The
+    // floor has to come last: applying it before rounding let half a cent round
+    // down to zero on the five-cent grid, so every option priced at or above
+    // $3.00 executed at exactly the mark with no spread cost. The floor is itself
+    // snapped up to the grid so the result stays a legal quote.
     half = std::min(half, f.mark_dollars * cfg.max_fraction_of_mark);
     half = std::max(half, 0.0);
 
+    const double tick = tick_size_dollars(f.mark_dollars);
     if (cfg.round_to_tick && half > 0.0) {
-        const double tick = tick_size_dollars(f.mark_dollars);
-        // Round the full spread to the grid, so half lands on a half-tick.
+        // The full spread lands on the grid, so a half-spread lands on a half-tick.
         half = std::round(2.0 * half / tick) * tick / 2.0;
     }
-    return half;
+
+    double floor_dollars = cfg.min_half_spread_cents / 100.0;
+    if (cfg.round_to_tick && floor_dollars > 0.0) {
+        floor_dollars = std::ceil(2.0 * floor_dollars / tick) * tick / 2.0;
+    }
+    return std::max(half, floor_dollars);
 }
 
 } // namespace obt

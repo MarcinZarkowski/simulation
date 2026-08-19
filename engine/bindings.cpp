@@ -332,6 +332,9 @@ PYBIND11_MODULE(obt_engine, m) {
         .def_readwrite("proportional_bps", &SpreadModelConfig::proportional_bps)
         .def_readwrite("log_base", &SpreadModelConfig::log_base)
         .def_readwrite("log_sigma", &SpreadModelConfig::log_sigma)
+        .def_readwrite("ref_implied_volatility", &SpreadModelConfig::ref_implied_volatility)
+        .def_readwrite("ref_days_to_expiry", &SpreadModelConfig::ref_days_to_expiry)
+        .def_readwrite("ref_volume", &SpreadModelConfig::ref_volume)
         .def_readwrite("variance_scale", &SpreadModelConfig::variance_scale)
         .def_readwrite("preserve_mean_under_variance_scale",
                        &SpreadModelConfig::preserve_mean_under_variance_scale)

@@ -18,7 +18,7 @@ from pathlib import Path
 
 import obt_engine as E
 
-from .report import build_report, convergence_table
+from .report import build_performance_report, build_report, convergence_table
 from .runner import run
 from .stream import UniverseFilter
 
@@ -117,6 +117,7 @@ def build_config(args: argparse.Namespace) -> tuple[E.BacktestConfig, dict]:
     cfg.spread_mc_paths = args.spread_mc_paths
     cfg.spread_mc_seed = args.spread_mc_seed
     cfg.spread_model.kind = SPREAD_MODELS[args.spread_model]
+    cfg.spread_model.variance_scale = args.spread_variance_scale
     cfg.execution_timing = EXECUTION_TIMING[args.execution_timing]
     cfg.assignment_policy = ASSIGNMENT_POLICIES[args.assignment_policy]
     cfg.margin_model = MARGIN_MODELS[args.margin_model]
@@ -168,6 +169,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--spread-model", choices=sorted(SPREAD_MODELS),
                    default="conditional_lognormal")
     p.add_argument("--spread-calibration", help="JSON file of spread-model parameters")
+    p.add_argument("--spread-variance-scale", type=float, default=1.0,
+                   help="scale the dispersion of the drawn bid/ask spread without "
+                        "moving its mean. 1.0 is the model as calibrated, 2.0 doubles "
+                        "the log-space standard deviation, 0.0 collapses every path "
+                        "onto the mean. Use it to see how much of a result the spread "
+                        "assumption owns.")
     p.add_argument("--report-confidence-level", type=float, default=0.95)
 
     p.add_argument("--min-dte", type=int)
@@ -226,27 +233,32 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{ticker}: no complete days found in range", file=sys.stderr)
             continue
 
-        report = build_report(result, args.report_confidence_level)
+        report = build_performance_report(
+            result, args.report_confidence_level, args.spread_variance_scale)
         if args.json:
             print(json.dumps({
                 "manifest": result.manifest.to_dict(),
                 "calibration": calibration,
-                "report": {k: v for k, v in report.__dict__.items()},
+                "monte_carlo": dict(report.monte_carlo.__dict__),
+                "account": {k: v for k, v in report.account.__dict__.items()
+                            if not k.endswith("_curve")},
+                "trades": {k: v for k, v in report.trades.__dict__.items()
+                           if k not in ("z_scores", "pnl")},
+                "path_index": report.path_index,
             }, indent=2, sort_keys=True, default=str))
             continue
 
-        print(f"\n=== {ticker} ===")
+        print(f"\n{'=' * 72}")
+        print(f"  {ticker}")
+        print("=" * 72)
         for key, value in result.manifest.to_dict().items():
             print(f"  {key:<20} {value}")
         if calibration:
             print(f"  {'calibration':<20} {calibration}")
+        print(f"  {'variance_scale':<20} {args.spread_variance_scale:g}")
+        print(f"  {'reported path':<20} median of {len(result.paths)} (index {report.path_index})")
         print()
-        print(report.summary())
-        if report.spread_model != "zero":
-            print()
-            print("  Spread cost is a modeled assumption, not reconstructed execution.")
-            print("  Without calibration against real quote history, treat the interval")
-            print("  as sensitivity analysis rather than a forecast.")
+        print(report.full())
     return 0
 
 

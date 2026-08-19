@@ -96,6 +96,11 @@ class RunResult:
     # about the distribution of individual trades.
     trades: list[list[E.TradeRecord]] = field(default_factory=list)
     equity_points: list[list[E.EquityPoint]] = field(default_factory=list)
+    # Net P&L from an actual zero-spread run, not inferred by adding mean spread
+    # cost back to the mean. Adding it back is only valid when the spread does not
+    # change WHICH orders fill, and a limit, buying-power or margin check can all
+    # flip on the draw -- measured at a 100% error on a two-line example.
+    deterministic_pnl: float | None = None
 
     @property
     def deterministic(self) -> bool:
@@ -139,6 +144,31 @@ def _spread_model_name(cfg: E.SpreadModelConfig) -> str:
     return str(cfg.kind).rsplit(".", 1)[-1].lower()
 
 
+def _zero_spread_copy(config: E.BacktestConfig) -> E.BacktestConfig:
+    """
+    The same configuration with execution cost removed.
+
+    Everything else is held identical so the difference between this run and a
+    Monte Carlo path is attributable to the spread alone.
+    """
+    out = E.BacktestConfig()
+    out.start = config.start
+    out.end = config.end
+    out.initial_cash = config.initial_cash
+    out.execution_timing = config.execution_timing
+    out.assignment_policy = config.assignment_policy
+    out.spread_mc_paths = 1
+    out.spread_mc_seed = config.spread_mc_seed
+    out.spread_model.kind = E.SpreadModelKind.ZERO
+    out.margin_model = config.margin_model
+    out.fees = config.fees
+    out.risk = config.risk
+    out.require_occ_confirmed_lineage = config.require_occ_confirmed_lineage
+    out.reject_fallback_analytics = config.reject_fallback_analytics
+    out.reject_stale_bars = config.reject_stale_bars
+    return out
+
+
 def run(
     strategy_factory,
     *,
@@ -168,10 +198,17 @@ def run(
         engines.append(engine)
         strategies.append(strategy_factory())
 
+    # One extra engine with execution cost switched off, advancing in lockstep.
+    # It is the only honest source for the "before spread cost" figure.
+    reference_config = _zero_spread_copy(config)
+    reference_engine = E.Engine(reference_config)
+    reference_engine.begin_scenario(0)
+    engines.append(reference_engine)
+    strategies.append(strategy_factory())
+
     contracts: dict[int, E.OptionContractVersion] = {}
     files_read: list[Path] = []
     day_count = 0
-    session_started = [False] * path_count
 
     for day in iter_days(lake, start, end, universe, require_complete_days):
         day_count += 1
@@ -189,9 +226,13 @@ def run(
             for engine in engines:
                 engine.queue_corporate_actions(transitions)
 
-        _run_day(day, engines, strategies, contracts, ticker, session_started)
+        _run_day(day, engines, strategies, contracts, ticker)
 
-    results = [engine.finalize() for engine in engines]
+    all_results = [engine.finalize() for engine in engines]
+    # The reference engine is the last one; it is not a Monte Carlo path.
+    results = all_results[:-1]
+    deterministic_pnl = all_results[-1].net_pnl
+    engines = engines[:-1]
     manifest = RunManifest(
         ticker=ticker,
         start=str(start) if start else "",
@@ -218,6 +259,7 @@ def run(
         rejections=list(engines[0].rejections()),
         trades=[list(e.trades()) for e in engines],
         equity_points=[list(e.equity_points()) for e in engines],
+        deterministic_pnl=deterministic_pnl,
     )
 
 
@@ -227,7 +269,6 @@ def _run_day(
     strategies: list[Strategy],
     contracts: dict[int, E.OptionContractVersion],
     ticker: str,
-    session_started: list[bool],
 ) -> None:
     """
     One trading day, following the spec's required ordering per timestamp.
@@ -256,7 +297,6 @@ def _run_day(
             session_day=session_day,
             scenario_id=i,
         ))
-        session_started[i] = True
 
     for ts, batch in iter_timestamp_batches(day):
         snapshot = build_snapshot(ts, batch, contracts, ticker)
