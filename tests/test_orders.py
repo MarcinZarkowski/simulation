@@ -316,11 +316,8 @@ class TestBuyingPower:
         assert len(spread.fills()) == 2
         assert spread.cash_micros == 1_200 * 10**6
 
-    @pytest.mark.xfail(reason="engine.h:526-532 credits the bought option's own market "
-                              "value back into the buying-power check, and both RegT and "
-                              "CashAccount charge zero for long options, so a long "
-                              "purchase can never fail and cash goes negative")
     def test_buy_costing_more_than_cash_is_rejected(self, engine):
+        """Long options are non-marginable, so cash must cover the debit in full."""
         h = engine(cash=400.0)
         h.bar(day_ns(1), bars_at(1, {CALL_100: 5.00}), groups=[group(buy(CALL_100))])
         h.bar(day_ns(2), bars_at(2, {CALL_100: 5.00}))
@@ -329,17 +326,27 @@ class TestBuyingPower:
         assert reasons(h) == [E.RejectReason.INSUFFICIENT_BUYING_POWER]
         assert h.cash_micros == 400 * 10**6
 
-    @pytest.mark.xfail(reason="engine.h:553-561 builds the margin context from the live "
-                              "book, so a probe position has no mark and the Reg-T naked "
-                              "requirement drops its premium term: $2,000 is charged at "
-                              "submission but $2,500 once the position is held")
     def test_naked_requirement_at_submission_matches_the_held_requirement(self, engine):
-        h = engine(cash=2_499.0, margin=E.MarginModel.REG_T)
-        h.bar(day_ns(1), bars_at(1, {PUT_100: 5.00}), groups=[group(sell(PUT_100))])
-        h.bar(day_ns(2), bars_at(2, {PUT_100: 5.00}))
+        """
+        The pre-trade probe must see the same marks the held position will, or an
+        order is admitted against a requirement it cannot sustain a bar later.
+        """
+        # Spot and strike are both 100, so the Reg-T requirement is
+        # max(20% x 100, 10% x 100) + 5.00 premium = $25/share = $2,500. The $500
+        # credit counts toward it, so own cash must reach $2,000. Were the
+        # premium term dropped the requirement would be $2,000 and $1,500 of own
+        # cash would suffice, which is what this boundary rules out.
+        rejected = engine(cash=1_500.0, margin=E.MarginModel.REG_T)
+        rejected.bar(day_ns(1), bars_at(1, {PUT_100: 5.00}), groups=[group(sell(PUT_100))])
+        rejected.bar(day_ns(2), bars_at(2, {PUT_100: 5.00}))
+        assert len(rejected.fills()) == 0
+        assert reasons(rejected) == [E.RejectReason.INSUFFICIENT_BUYING_POWER]
 
-        assert len(h.fills()) == 0
-        assert reasons(h) == [E.RejectReason.INSUFFICIENT_BUYING_POWER]
+        filled = engine(cash=2_000.0, margin=E.MarginModel.REG_T)
+        filled.bar(day_ns(1), bars_at(1, {PUT_100: 5.00}), groups=[group(sell(PUT_100))])
+        state = filled.bar(day_ns(2), bars_at(2, {PUT_100: 5.00}))
+        assert len(filled.fills()) == 1
+        assert state.margin_requirement == pytest.approx(2_500.0)
 
 
 class TestCashAndPositionBookkeeping:
