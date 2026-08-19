@@ -469,7 +469,9 @@ PYBIND11_MODULE(obt_engine, m) {
         .def_readwrite("require_occ_confirmed_lineage", &BacktestConfig::require_occ_confirmed_lineage)
         .def_readwrite("reject_fallback_analytics", &BacktestConfig::reject_fallback_analytics)
         .def_readwrite("reject_stale_bars", &BacktestConfig::reject_stale_bars)
-        .def_readwrite("require_point_in_time_terms", &BacktestConfig::require_point_in_time_terms);
+        .def_readwrite("require_point_in_time_terms", &BacktestConfig::require_point_in_time_terms)
+        .def_readwrite("mark_age_limit_ns", &BacktestConfig::mark_age_limit_ns)
+        .def_readwrite("require_monotonic_time", &BacktestConfig::require_monotonic_time);
 
     py::class_<PathMetrics>(m, "PathMetrics")
         .def_readonly("scenario_id", &PathMetrics::scenario_id)
@@ -506,6 +508,8 @@ PYBIND11_MODULE(obt_engine, m) {
         .def_readonly("early_assignment_count", &PathMetrics::early_assignment_count)
         .def_readonly("settlements_without_official_price",
                       &PathMetrics::settlements_without_official_price)
+        .def_readonly("stale_mark_valuations", &PathMetrics::stale_mark_valuations)
+        .def_readonly("max_mark_age_ns", &PathMetrics::max_mark_age_ns)
         .def_property_readonly("dividend_cash",
             [](const PathMetrics& m) { return m.dividend_cash.to_double(); })
         .def_property_readonly("dividend_cash_micros",

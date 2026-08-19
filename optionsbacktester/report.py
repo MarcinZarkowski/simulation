@@ -73,6 +73,9 @@ class MonteCarloReport:
     total_rejections: int
     mean_dividend_cash: float
     total_early_assignments: int
+    stale_mark_valuations: int
+    max_mark_age_days: float
+    settlements_without_official_price: int
     ledger_reconciles: bool
     degenerate: bool
     truncated_paths: int
@@ -135,6 +138,29 @@ class MonteCarloReport:
             f"  fills {self.total_fills}   rejections {self.total_rejections}"
             f"   ledger reconciles {self.ledger_reconciles}",
         ]
+        if self.stale_mark_valuations:
+            lines += [
+                "",
+                f"  stale-mark valuations {self.stale_mark_valuations:>11}"
+                f"   oldest mark {self.max_mark_age_days:.1f} day(s)",
+                "  Those positions were valued at intrinsic against a fresh underlying,",
+                "  because the contract itself had stopped printing. Intrinsic is a floor,",
+                "  so an out-of-the-money position marked this way reads as worthless.",
+            ]
+        elif self.max_mark_age_days >= 1.0:
+            lines += [
+                "",
+                f"  oldest mark used    {self.max_mark_age_days:>14.1f} day(s)",
+            ]
+        if self.settlements_without_official_price:
+            lines += [
+                "",
+                f"  settled without an official value: "
+                f"{self.settlements_without_official_price}",
+                "  A cash-settled contract resolved against the last observed spot rather",
+                "  than a published settlement value, which is computed from opening prints",
+                "  and can differ materially.",
+            ]
         if self.truncated_paths:
             lines += [
                 "",
@@ -329,6 +355,11 @@ def build_report(result: RunResult, confidence_level: float = 0.95,
         total_rejections=sum(p.rejection_count for p in paths),
         mean_dividend_cash=statistics.fmean(p.dividend_cash for p in paths),
         total_early_assignments=sum(p.early_assignment_count for p in paths),
+        stale_mark_valuations=sum(p.stale_mark_valuations for p in paths),
+        max_mark_age_days=max((p.max_mark_age_ns for p in paths), default=0)
+        / (86_400 * 1_000_000_000),
+        settlements_without_official_price=sum(
+            p.settlements_without_official_price for p in paths),
         ledger_reconciles=all(p.ledger_reconciles for p in paths),
         truncated_paths=sum(1 for p in paths if p.truncated),
         quarantined_positions=sum(p.quarantined_positions for p in paths),

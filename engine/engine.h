@@ -97,6 +97,23 @@ struct BacktestConfig {
     // later snapshot. Closing one is always allowed: the position exists, and
     // refusing to exit it would be a worse distortion than the hindsight.
     bool require_point_in_time_terms = true;
+
+    // How old a carried-forward mark may be before the engine stops calling it a
+    // price. A contract that stops printing used to keep its last mark forever, so
+    // an illiquid option that last traded three months ago still valued the book
+    // and still set the margin requirement, with nothing recorded to say so.
+    //
+    // Beyond this age the position is valued at intrinsic against a FRESH
+    // underlying, which is the defensible floor -- an option is worth at least its
+    // intrinsic whether or not anyone traded it. Where the underlying is stale too,
+    // the stale mark is used and the path is flagged, because there is nothing
+    // better available and silently reporting zero would be worse.
+    int64_t mark_age_limit_ns = 3LL * 86'400 * 1'000'000'000;
+
+    // Refuse a snapshot whose timestamp does not advance. Two bars at the same
+    // instant let an order submitted on one fill on the other, which defeats
+    // next-bar-open timing; a bar that goes backwards is time travel.
+    bool require_monotonic_time = true;
 };
 
 // Why a position stopped existing. Distinguishing these matters because a
@@ -180,6 +197,10 @@ struct PathMetrics {
     // settlement value was published. Surfaced rather than hidden: SET and VRO are
     // computed from opening prints and can differ materially from the last bar.
     int64_t settlements_without_official_price = 0;
+    // Positions valued against a mark older than the configured limit, and the
+    // oldest mark any valuation leaned on.
+    int64_t stale_mark_valuations = 0;
+    int64_t max_mark_age_ns = 0;
     // Net dividend cash: received on long shares, owed on short.
     Money dividend_cash{};
 };
@@ -220,6 +241,14 @@ struct AccountState {
 
 class Engine {
 public:
+    // A carried-forward mark and when it was printed. The timestamp is the point:
+    // without it there is no way to tell a price from this minute from one from
+    // last quarter.
+    struct StampedMark {
+        Money price{};
+        Timestamp at{};
+    };
+
     explicit Engine(BacktestConfig cfg)
         : cfg_(std::move(cfg)), margin_(make_margin_model(cfg_.margin_model)) {}
 
@@ -280,6 +309,8 @@ public:
         // every Monte Carlo path sees the same ones -- but anything derived from
         // one path's positions must not leak into the next.
         applied_dividend_ids_.clear();
+        last_mark_.clear();
+        bars_seen_ = 0;
         accruals_.clear();
         prior_close_mark_.clear();
         prior_close_spot_.clear();
@@ -291,8 +322,17 @@ public:
     // Steps 1-3 and 6 of the required ordering: apply lineage effective before
     // this instant, ingest the bars, then fill orders submitted earlier.
     void begin_bar(MarketSnapshot snapshot) {
+        if (cfg_.require_monotonic_time && bars_seen_ > 0
+            && snapshot.timestamp <= now_) {
+            throw std::invalid_argument(
+                snapshot.timestamp == now_
+                    ? "begin_bar: repeated timestamp; an order submitted on one bar "
+                      "would fill on the other at the same instant"
+                    : "begin_bar: timestamp went backwards");
+        }
         current_ = std::move(snapshot);
         now_ = current_.timestamp;
+        bars_seen_++;
 
         apply_due_corporate_actions();
         index_current_bars();
@@ -426,15 +466,56 @@ private:
     }
 
     // The mark the pipeline chose, so engine and pipeline agree on value.
+    //
+    // Where the last print is older than the configured limit, falls back to
+    // intrinsic against a fresh underlying rather than carrying a stale price
+    // indefinitely. Either way the age is recorded, so a report can say how old the
+    // prices behind a valuation were.
     Money mark_for(ContractVersionId cv) const {
         const MarketBar* b = bar_for(cv);
-        if (b == nullptr) return last_mark(cv);
-        return b->valuation_price.is_zero() ? b->close : b->valuation_price;
+        if (b != nullptr)
+            return b->valuation_price.is_zero() ? b->close : b->valuation_price;
+
+        auto it = last_mark_.find(cv.value);
+        if (it == last_mark_.end()) return Money::zero();
+        const StampedMark& held = it->second;
+        const int64_t age = now_.epoch_ns - held.at.epoch_ns;
+        note_mark_age(age);
+        if (cfg_.mark_age_limit_ns <= 0 || age <= cfg_.mark_age_limit_ns)
+            return held.price;
+
+        const OptionContractVersion* c = registry().find(cv);
+        // Intrinsic is only an improvement on a stale mark if the SPOT is fresh.
+        // Both stale means there is nothing better available, and reporting zero
+        // would be worse than reporting the old print -- but the path is flagged
+        // either way.
+        if (c == nullptr || !underlying_is_fresh(c->underlying_symbol))
+            return held.price;
+        // Per-share intrinsic, since a mark is quoted per share.
+        const Money aggregate = c->payoff_at(underlying_of(c->underlying_symbol));
+        const int64_t mult = c->quote_multiplier > 0 ? c->quote_multiplier : 1;
+        return Money{aggregate.micros / mult};
+    }
+
+    // Whether this underlying was priced recently enough to derive intrinsic from.
+    bool underlying_is_fresh(const std::string& sym) const {
+        if (current_.underlying_price.count(sym)) return true;
+        auto it = last_underlying_.find(sym);
+        if (it == last_underlying_.end()) return false;
+        if (cfg_.mark_age_limit_ns <= 0) return true;
+        return now_.epoch_ns - it->second.at.epoch_ns <= cfg_.mark_age_limit_ns;
     }
 
     Money last_mark(ContractVersionId cv) const {
         auto it = last_mark_.find(cv.value);
-        return it == last_mark_.end() ? Money::zero() : it->second;
+        return it == last_mark_.end() ? Money::zero() : it->second.price;
+    }
+
+    void note_mark_age(int64_t age_ns) const {
+        if (age_ns <= 0) return;
+        if (age_ns > metrics_.max_mark_age_ns) metrics_.max_mark_age_ns = age_ns;
+        if (cfg_.mark_age_limit_ns > 0 && age_ns > cfg_.mark_age_limit_ns)
+            metrics_.stale_mark_valuations++;
     }
 
     // -----------------------------------------------------------------------
@@ -594,7 +675,7 @@ private:
         auto it = current_.underlying_price.find(sym);
         if (it != current_.underlying_price.end()) return it->second;
         auto fallback = last_underlying_.find(sym);
-        return fallback == last_underlying_.end() ? Money::zero() : fallback->second;
+        return fallback == last_underlying_.end() ? Money::zero() : fallback->second.price;
     }
 
     // Validates every leg, then commits all of them or none. A broker does not
@@ -989,8 +1070,8 @@ private:
     MarginContext margin_context() const {
         MarginContext ctx;
         ctx.underlying_price = current_.underlying_price;
-        for (const auto& [sym, px] : last_underlying_)
-            ctx.underlying_price.emplace(sym, px);
+        for (const auto& [sym, stamped] : last_underlying_)
+            ctx.underlying_price.emplace(sym, stamped.price);
 
         // Marks come from every contract quoted at this instant, not just the
         // ones already held. A pre-trade probe evaluates a position that is not
@@ -1357,9 +1438,10 @@ private:
             s.margin_requirement, position_market_value(), s.open_position_count,
         });
         for (const MarketBar& b : current_.bars)
-            last_mark_[b.contract_version_id.value] =
-                b.valuation_price.is_zero() ? b.close : b.valuation_price;
-        for (const auto& [sym, px] : current_.underlying_price) last_underlying_[sym] = px;
+            last_mark_[b.contract_version_id.value] = StampedMark{
+                b.valuation_price.is_zero() ? b.close : b.valuation_price, now_};
+        for (const auto& [sym, px] : current_.underlying_price)
+            last_underlying_[sym] = StampedMark{px, now_};
     }
 
     BacktestConfig cfg_;
@@ -1386,13 +1468,14 @@ private:
     std::unordered_map<uint64_t, const MarketBar*> bar_index_;
     std::unordered_map<std::string, const EquityBar*> equity_bar_index_;
     std::unordered_map<uint64_t, const OptionAnalytics*> analytics_index_;
-    std::unordered_map<uint64_t, Money> last_mark_;
-    std::unordered_map<std::string, Money> last_underlying_;
+    std::unordered_map<uint64_t, StampedMark> last_mark_;
+    uint64_t bars_seen_ = 0;
+    std::unordered_map<std::string, StampedMark> last_underlying_;
 
     std::vector<Money> equity_curve_;
     std::vector<EquityPoint> equity_points_;
     std::vector<TradeRecord> trades_;
-    PathMetrics metrics_;
+    mutable PathMetrics metrics_;
     Timestamp now_{};
     uint32_t scenario_id_ = 0;
     uint64_t next_order_id_ = 1;
