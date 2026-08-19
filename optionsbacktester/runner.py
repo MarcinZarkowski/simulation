@@ -335,13 +335,19 @@ def _run_day(
                 scenario_id=i,
             )
 
+            # Adjustments are applied at the start of the bar, before the strategy
+            # is asked for orders, so it can react before referencing a version the
+            # engine has already superseded.
+            for action in engine.corporate_actions_this_bar():
+                strategy.on_corporate_action(action, context)
+
             for order_group in strategy.on_market_snapshot(chain, context) or ():
                 engine.submit_group(order_group)
 
             engine.end_bar()
 
-            # on_fill and on_corporate_action were declared in the Strategy API
-            # and never invoked, so any strategy logic in them silently never ran.
+            # on_fill was declared in the Strategy API and never invoked, so any
+            # strategy logic in it silently never ran.
             for fill in engine.fills()[delivered_fills[i]:]:
                 strategy.on_fill(fill, context)
             delivered_fills[i] = len(engine.fills())

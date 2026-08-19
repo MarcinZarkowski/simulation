@@ -700,6 +700,8 @@ PYBIND11_MODULE(obt_engine, m) {
             e.set_registry(std::move(r));
         }, py::arg("registry"))
         .def("queue_dividends", &Engine::queue_dividends, py::arg("events"))
+        .def("corporate_actions_this_bar", &Engine::corporate_actions_this_bar,
+             py::return_value_policy::reference_internal)
         .def("queue_corporate_actions", &Engine::queue_corporate_actions, py::arg("events"))
         .def("begin_scenario", &Engine::begin_scenario, py::arg("scenario_id"))
         .def("begin_bar", &Engine::begin_bar, py::arg("snapshot"))

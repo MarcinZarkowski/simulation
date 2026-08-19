@@ -304,6 +304,7 @@ public:
         trades_.clear();
         equity_points_.clear();
         applied_actions_.clear();
+        actions_this_bar_.clear();
         superseded_versions_.clear();
         // Queued dividends survive a scenario reset -- they are market data, and
         // every Monte Carlo path sees the same ones -- but anything derived from
@@ -334,6 +335,7 @@ public:
         now_ = current_.timestamp;
         bars_seen_++;
 
+        actions_this_bar_.clear();
         apply_due_corporate_actions();
         index_current_bars();
         process_dividends();
@@ -413,6 +415,14 @@ public:
         s.fees_paid = ledger_.fees_paid();
         s.open_position_count = static_cast<int64_t>(book_.open_count());
         return s;
+    }
+
+    // Adjustments applied on the current bar. on_corporate_action was declared in
+    // the Strategy API and never invoked, so a strategy could not react to its own
+    // position being converted -- it would keep referencing a version the engine had
+    // already superseded.
+    const std::vector<CorporateActionTransition>& corporate_actions_this_bar() const {
+        return actions_this_bar_;
     }
 
     const PathMetrics& metrics() const { return metrics_; }
@@ -551,6 +561,7 @@ private:
                     quarantine(t.parent_version_id, held,
                                "adjustment has no OCC-confirmed lineage");
                     applied_actions_.insert(t.lineage_event_id);
+                    actions_this_bar_.push_back(t);
                 }
                 continue;
             }
@@ -564,11 +575,13 @@ private:
                 quarantine(t.parent_version_id, held,
                            "quantity conversion does not divide the holding evenly");
                 applied_actions_.insert(t.lineage_event_id);
+                actions_this_bar_.push_back(t);
                 continue;
             }
 
             transfer_position(t, held);
             applied_actions_.insert(t.lineage_event_id);
+            actions_this_bar_.push_back(t);
         }
     }
 
@@ -1455,6 +1468,7 @@ private:
     std::vector<OrderRejection> rejections_;
     std::vector<CorporateActionTransition> pending_actions_;
     std::set<uint64_t> applied_actions_;
+    std::vector<CorporateActionTransition> actions_this_bar_;
     std::set<uint64_t> queued_event_ids_;
     std::set<uint64_t> superseded_versions_;
     std::vector<DividendEvent> dividends_;

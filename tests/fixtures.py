@@ -122,6 +122,12 @@ class LakeSpec:
     fallback_iv_symbols: tuple[str, ...] = ()
     unpriced_adjusted_symbols: tuple[str, ...] = ()
     extra_columns: dict = field(default_factory=dict)
+    # Reference frames the pipeline co-locates with each bar-day. Written to every
+    # day in the range, which is what the pipeline does -- each day's file describes
+    # the chain that was live then.
+    corporate_actions: object = None      # list[dict] | None
+    lineage_events: object = None         # list[dict] | None
+    contract_versions: object = None      # list[dict] | None
 
     def price_on(self, day_index: int) -> float:
         if self.underlying_path is None:
@@ -275,13 +281,26 @@ def write_lake(root: Path, spec: LakeSpec) -> Path:
         stock.write_parquet(day_dir / "stock.parquet",
                             compression="zstd", compression_level=3, statistics=True)
 
+        counts = {
+            "options_enriched.parquet": options.height,
+            "stock.parquet": stock.height,
+        }
+        for name, rows in (
+            ("corporate_actions.parquet", spec.corporate_actions),
+            ("option_lineage_event.parquet", spec.lineage_events),
+            ("option_contract_version.parquet", spec.contract_versions),
+        ):
+            if not rows:
+                continue
+            frame = pl.DataFrame(list(rows))
+            frame.write_parquet(day_dir / name, compression="zstd",
+                                compression_level=3, statistics=True)
+            counts[name] = frame.height
+
         (day_dir / "_SUCCESS").write_text(json.dumps({
             "status": "COMPLETE",
             "pipeline_version": "2.0.0",
-            "row_counts": {
-                "options_enriched.parquet": options.height,
-                "stock.parquet": stock.height,
-            },
+            "row_counts": counts,
         }, indent=2, sort_keys=True))
 
     return Path(root)
