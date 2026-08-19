@@ -13,4 +13,12 @@ dependencies = [
     "platformdirs>=4.0",
     "pybind11>=3.0.4",
     "scipy>=1.17.1",
+    "polars>=1.43.2",
+    "pyarrow>=24.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pybind11>=3.0.4",
+    "setuptools>=84.0.0",
 ]

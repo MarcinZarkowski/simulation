@@ -1,0 +1,214 @@
+"""
+Translate pipeline rows into engine structs.
+
+The pipeline is the source of truth for contract terms, marks, and analytics
+quality. Nothing here recomputes a price or invents a strike: the mapping is
+mechanical, and where the pipeline says a row is unusable the flag is carried
+through rather than reinterpreted.
+"""
+from __future__ import annotations
+
+from datetime import datetime
+
+import polars as pl
+
+import obt_engine as E
+
+NS_PER_SECOND = 1_000_000_000
+
+
+def to_ns(value: datetime) -> int:
+    """Epoch nanoseconds from a tz-naive UTC datetime, matching the lake."""
+    if value.tzinfo is not None:
+        value = value.replace(tzinfo=None)
+    epoch = datetime(1970, 1, 1)
+    delta = value - epoch
+    return (delta.days * 86400 + delta.seconds) * NS_PER_SECOND + delta.microseconds * 1000
+
+
+def contract_version_key(symbol: str, strike: float, equity_amount: float, multiplier: float) -> int:
+    """
+    Identity for one set of terms.
+
+    Deliberately includes the deliverable and the multiplier, not just the
+    symbol: after an adjustment the same symbol can describe different
+    economics, and treating those as one instrument is the bug this avoids.
+    """
+    return E.hash_symbol(f"{symbol}|{strike:.6f}|{equity_amount:.6f}|{multiplier:.6f}")
+
+
+def instrument_key(underlying: str, expiration: datetime, flag: str, strike: float) -> int:
+    """Identity for the economic series, which survives a symbol change."""
+    return E.hash_symbol(f"{underlying}|{expiration.isoformat()}|{flag}|{strike:.6f}")
+
+
+def _float(row: dict, name: str, default: float) -> float:
+    value = row.get(name)
+    return default if value is None else float(value)
+
+
+def build_contracts(options: pl.DataFrame, underlying_symbol: str) -> dict[int, E.OptionContractVersion]:
+    """
+    One contract version per distinct set of terms seen in the frame.
+
+    Deduplicated on the version key, so a contract quoted across 390 minutes
+    produces one struct rather than 390.
+    """
+    if options.is_empty():
+        return {}
+
+    wanted = [
+        "symbol", "strike", "pricing_strike", "flag", "expiration",
+        "quote_multiplier", "deliverable_equity_amount", "deliverable_cash_amount",
+        "is_adjusted_contract", "adjusted_pricing_status",
+    ]
+    present = [c for c in wanted if c in options.columns]
+    unique_terms = options.select(present).unique(subset=["symbol"], keep="first")
+
+    out: dict[int, E.OptionContractVersion] = {}
+    for row in unique_terms.iter_rows(named=True):
+        symbol = row["symbol"]
+        strike = _float(row, "strike", 0.0)
+        multiplier = _float(row, "quote_multiplier", 100.0)
+        equity_amount = _float(row, "deliverable_equity_amount", 100.0)
+        expiration = row["expiration"]
+
+        c = E.OptionContractVersion()
+        key = contract_version_key(symbol, strike, equity_amount, multiplier)
+        c.id = key
+        c.instrument_id = instrument_key(underlying_symbol, expiration, row["flag"], strike)
+        c.symbol = symbol
+        c.underlying_symbol = underlying_symbol
+        c.type = E.OptionType.CALL if row["flag"] == "c" else E.OptionType.PUT
+        c.strike = strike
+        c.pricing_strike = _float(row, "pricing_strike", strike)
+        c.quote_multiplier = int(round(multiplier))
+        c.deliverable_equity_microshares = int(round(equity_amount * 1_000_000))
+        c.deliverable_cash = _float(row, "deliverable_cash_amount", 0.0)
+        c.is_adjusted = bool(row.get("is_adjusted_contract", False))
+
+        status = row.get("adjusted_pricing_status") or "standard_contract"
+        # The pipeline refuses to price deliverables it cannot value exactly.
+        # Such a contract may be exited but never entered.
+        priced = status != "unpriced_adjusted_contract"
+        c.tradable_for_new_positions = priced
+        c.analytics_supported = priced
+
+        c.expiration = to_ns(expiration)
+        c.valid_from = 0
+        c.valid_to = c.expiration
+        out[key] = c
+    return out
+
+
+def build_bars(batch: pl.DataFrame, contracts: dict[int, E.OptionContractVersion]) -> list[E.MarketBar]:
+    """Market bars for one timestamp."""
+    bars: list[E.MarketBar] = []
+    for row in batch.iter_rows(named=True):
+        key = contract_version_key(
+            row["symbol"], _float(row, "strike", 0.0),
+            _float(row, "deliverable_equity_amount", 100.0),
+            _float(row, "quote_multiplier", 100.0),
+        )
+        if key not in contracts:
+            continue
+        b = E.MarketBar()
+        b.timestamp = to_ns(row["timestamp"])
+        b.contract_version_id = key
+        b.open = _float(row, "open", 0.0)
+        b.high = _float(row, "high", 0.0)
+        b.low = _float(row, "low", 0.0)
+        b.close = _float(row, "close", 0.0)
+        b.vwap = _float(row, "vwap", 0.0)
+        # The pipeline's chosen mark. Falling back to close keeps a bar usable
+        # when only the close is populated.
+        b.valuation_price = _float(row, "valuation_price", b.close)
+        b.volume = int(row.get("volume") or 0)
+        b.trade_count = int(row.get("trade_count") or 0)
+        b.stale = bool(row.get("is_stale", False))
+        # Analytics are valid only if the pipeline solved a real IV for them.
+        b.analytics_valid = not (
+            bool(row.get("iv_failed", False)) or bool(row.get("iv_is_model_fallback", False))
+        )
+        bars.append(b)
+    return bars
+
+
+def build_analytics(batch: pl.DataFrame, contracts: dict[int, E.OptionContractVersion]) -> list[E.OptionAnalytics]:
+    """Greeks and IV for one timestamp, marked invalid where the pipeline fell back."""
+    out: list[E.OptionAnalytics] = []
+    for row in batch.iter_rows(named=True):
+        key = contract_version_key(
+            row["symbol"], _float(row, "strike", 0.0),
+            _float(row, "deliverable_equity_amount", 100.0),
+            _float(row, "quote_multiplier", 100.0),
+        )
+        if key not in contracts:
+            continue
+        a = E.OptionAnalytics()
+        a.timestamp = to_ns(row["timestamp"])
+        a.contract_version_id = key
+        a.implied_volatility = _float(row, "smoothed_iv", 0.0)
+        a.delta = _float(row, "delta", 0.0)
+        a.gamma = _float(row, "gamma", 0.0)
+        a.theta = _float(row, "theta", 0.0)
+        a.vega = _float(row, "vega", 0.0)
+        a.rho = _float(row, "rho", 0.0)
+        a.valid = not (
+            bool(row.get("iv_failed", False)) or bool(row.get("iv_is_model_fallback", False))
+        )
+        out.append(a)
+    return out
+
+
+def build_snapshot(
+    timestamp: datetime,
+    batch: pl.DataFrame,
+    contracts: dict[int, E.OptionContractVersion],
+    underlying_symbol: str,
+) -> E.MarketSnapshot:
+    """A full point-in-time snapshot for the engine."""
+    snap = E.MarketSnapshot()
+    snap.timestamp = to_ns(timestamp)
+    snap.bars = build_bars(batch, contracts)
+    snap.analytics = build_analytics(batch, contracts)
+
+    price = None
+    if "underlying_price" in batch.columns:
+        prices = batch["underlying_price"].drop_nulls()
+        if len(prices) > 0:
+            price = float(prices[0])
+    snap.underlying_price = {underlying_symbol: price} if price is not None else {}
+    return snap
+
+
+def build_lineage_transitions(
+    lineage: pl.DataFrame,
+    contracts: dict[int, E.OptionContractVersion],
+) -> list[E.CorporateActionTransition]:
+    """
+    Convert pipeline lineage rows into engine transitions.
+
+    ``occ_confirmed`` and the quantity conversion are carried through verbatim.
+    An unconfirmed row still becomes a transition so the engine can refuse to
+    carry a position through it, rather than the adjustment passing unnoticed.
+    """
+    if lineage.is_empty():
+        return []
+
+    by_symbol = {c.symbol: key for key, c in contracts.items()}
+    out: list[E.CorporateActionTransition] = []
+    for row in lineage.iter_rows(named=True):
+        t = E.CorporateActionTransition()
+        t.lineage_event_id = E.hash_symbol(str(row.get("lineage_event_id", "")))
+        effective = row.get("effective_at")
+        available = row.get("source_available_at")
+        t.effective_at = to_ns(effective) if effective else 0
+        t.source_available_at = to_ns(available) if available else t.effective_at
+        t.parent_version_id = by_symbol.get(row.get("parent_symbol"), 0)
+        t.child_version_id = by_symbol.get(row.get("child_symbol"), 0)
+        t.parent_contracts = int(row.get("parent_contracts") or 0)
+        t.child_contracts = int(row.get("child_contracts") or 0)
+        t.occ_confirmed = bool(row.get("occ_confirmed", False))
+        out.append(t)
+    return out
