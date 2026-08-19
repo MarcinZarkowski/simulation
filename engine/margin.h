@@ -201,7 +201,18 @@ inline std::vector<SpreadPairing> pair_legs(
                 const Money residual = (type == OptionType::Call)
                     ? max_money(l.contract->strike - s.contract->strike, Money::zero())
                     : max_money(s.contract->strike - l.contract->strike, Money::zero());
-                if (best == nullptr || residual < best_residual) {
+                // Lowest residual wins; ties go to the EARLIEST-expiring eligible
+                // long, which conserves long-dated longs for the shorts that need
+                // them. Without the tie-break the winner was whichever long
+                // happened to be encountered first -- position-id order, hence
+                // the order the legs were opened -- so the same portfolio was
+                // legal or refused depending on how it was assembled.
+                const bool better =
+                    best == nullptr
+                    || residual < best_residual
+                    || (residual == best_residual
+                        && l.contract->expiration < best->contract->expiration);
+                if (better) {
                     best = &l;
                     best_residual = residual;
                 }

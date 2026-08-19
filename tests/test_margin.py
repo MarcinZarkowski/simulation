@@ -7,6 +7,8 @@ engine in exact microdollars, never against a value read back out of the engine.
 """
 from __future__ import annotations
 
+import itertools
+
 import pytest
 
 import obt_engine as E
@@ -885,3 +887,66 @@ class TestEquityMargin:
         ten = margin(E.MarginModel.REG_T, [], [], spot=self.SPOT,
                      shares={SYMBOL: 1000}).requirement_micros
         assert ten == 10 * one
+
+
+class TestPermutationInvariance:
+    """
+    The same portfolio must margin the same however it was assembled.
+
+    Pairing preferred whichever eligible long it encountered first, which is
+    position-id order, which is the order the legs were opened. A strategy that
+    legged into a calendar in the "wrong" sequence was refused outright.
+    """
+
+    def _legs(self):
+        return [
+            make_contract(1, strike=100.0, expiry_day=30),    # short, near
+            make_contract(2, strike=100.0, expiry_day=400),   # short, far
+            make_contract(3, strike=100.0, expiry_day=30),    # long, near
+            make_contract(4, strike=100.0, expiry_day=400),   # long, far
+        ]
+
+    HOLDINGS = [(3, 1), (4, 1), (1, -1), (2, -1)]
+    MARKS = {1: 5.0, 2: 12.0}
+
+    def test_every_permutation_gives_the_same_requirement(self):
+        legs = self._legs()
+        outcomes = {
+            (margin(E.MarginModel.ROBINHOOD, legs, list(perm),
+                    marks=self.MARKS).requirement_micros,
+             margin(E.MarginModel.ROBINHOOD, legs, list(perm),
+                    marks=self.MARKS).disallowed)
+            for perm in itertools.permutations(self.HOLDINGS)
+        }
+        assert len(outcomes) == 1
+
+    def test_a_valid_pairing_is_found_rather_than_refused(self):
+        """Near short pairs with near long, far short with far long."""
+        result = margin(E.MarginModel.ROBINHOOD, self._legs(), self.HOLDINGS,
+                        marks=self.MARKS)
+        assert not result.disallowed
+        assert result.requirement_micros == 0
+
+    def test_ties_conserve_the_long_dated_long(self):
+        """
+        With two equal-residual longs available, the shortest-dated short takes
+        the earliest-expiring one so a long-dated long stays free for the short
+        that actually needs it.
+        """
+        legs = self._legs()
+        result = margin(E.MarginModel.ROBINHOOD, legs, self.HOLDINGS, marks=self.MARKS)
+        by_short = {p.short_leg: p.long_leg for p in result.pairings}
+        assert by_short[1] == 3
+        assert by_short[2] == 4
+
+
+class TestDisallowedIsVisible:
+    def test_a_refused_book_still_reports_that_it_was_refused(self):
+        """
+        A Disallow verdict contributes nothing to the requirement, so a check of
+        the form 'requirement > equity' could never see an impossible book.
+        """
+        naked = make_contract(1, strike=100.0, expiry_day=30)
+        result = margin(E.MarginModel.ROBINHOOD, [naked], [(1, -10)], marks={1: 5.0})
+        assert result.disallowed
+        assert result.disallowed_reason

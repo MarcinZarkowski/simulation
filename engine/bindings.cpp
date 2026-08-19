@@ -507,7 +507,9 @@ PYBIND11_MODULE(obt_engine, m) {
         .def_property_readonly("realized_pnl", [](const AccountState& s) { return s.realized_pnl.to_double(); })
         .def_property_readonly("unrealized_pnl", [](const AccountState& s) { return s.unrealized_pnl.to_double(); })
         .def_property_readonly("fees_paid", [](const AccountState& s) { return s.fees_paid.to_double(); })
-        .def_readonly("open_position_count", &AccountState::open_position_count);
+        .def_readonly("open_position_count", &AccountState::open_position_count)
+        .def_readonly("margin_disallowed", &AccountState::margin_disallowed)
+        .def_readonly("margin_disallowed_reason", &AccountState::margin_disallowed_reason);
 
     py::class_<MarketSnapshot>(m, "MarketSnapshot")
         .def(py::init<>())

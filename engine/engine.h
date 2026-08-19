@@ -176,6 +176,11 @@ struct AccountState {
     Money unrealized_pnl{};
     Money fees_paid{};
     int64_t open_position_count = 0;
+    // The broker model says this book cannot exist. Previously a Disallow verdict
+    // contributed nothing to the requirement, so a book of ten naked short calls
+    // reported a $0 requirement and margin_breached false.
+    bool margin_disallowed = false;
+    std::string margin_disallowed_reason;
 };
 
 class Engine {
@@ -294,7 +299,10 @@ public:
         s.cash = ledger_.cash();
         s.realized_pnl = book_.realized_pnl_total() + book_.equity_realized_pnl();
         s.unrealized_pnl = unrealized_pnl();
-        s.margin_requirement = current_margin().requirement;
+        const MarginResult margin = current_margin();
+        s.margin_requirement = margin.requirement;
+        s.margin_disallowed = margin.disallowed;
+        s.margin_disallowed_reason = margin.disallowed_reason;
         s.equity = s.cash + position_market_value();
         s.buying_power = s.equity - s.margin_requirement;
         s.fees_paid = ledger_.fees_paid();
@@ -952,7 +960,11 @@ private:
         if (s.margin_requirement > metrics_.peak_margin_requirement)
             metrics_.peak_margin_requirement = s.margin_requirement;
 
-        if (s.margin_requirement > s.equity) metrics_.margin_breached = true;
+        // A book the broker model refuses is a breach whatever the arithmetic
+        // requirement came to, since the requirement is not defined for a position
+        // that cannot be held.
+        if (s.margin_requirement > s.equity || s.margin_disallowed)
+            metrics_.margin_breached = true;
 
         const RiskLimits& r = cfg_.risk;
         if (r.max_drawdown_fraction > 0.0 && !metrics_.peak_equity.is_zero()) {
