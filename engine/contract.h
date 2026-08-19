@@ -125,12 +125,12 @@ struct OptionContractVersion {
     // K=100 with spot 110 paid $5,000 for $5,500 of stock on a contract whose true
     // payoff was zero.
     Money aggregate_exercise_price() const {
-        return Money{strike.micros * quote_multiplier};
+        return Money::scaled(strike.micros, quote_multiplier);
     }
 
     // Total value delivered per contract at a given underlying price.
     Money delivered_value(Money underlying) const {
-        return Money{underlying.micros * deliverable_shares_per_contract()} + deliverable_cash;
+        return Money::scaled(underlying.micros, deliverable_shares_per_contract()) + deliverable_cash;
     }
 
     // Intrinsic value per contract, following the deliverable rather than
@@ -144,7 +144,7 @@ struct OptionContractVersion {
 
     // Notional the contract controls at a given underlying price.
     Money notional(Money underlying) const {
-        return Money{underlying.micros * deliverable_shares_per_contract()};
+        return Money::scaled(underlying.micros, deliverable_shares_per_contract());
     }
 };
 

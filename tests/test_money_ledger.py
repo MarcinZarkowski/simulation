@@ -521,3 +521,72 @@ class TestRoundTripCostAttribution:
         trades = h.engine.trades()
         assert len(trades) == 1
         assert 0 < trades[0].fees_micros < h.finalize().fees_micros
+
+
+class TestOverflowIsChecked:
+    """
+    Money products were unguarded. Headroom is large -- int64 microdollars top out
+    near $9.2e12 -- but the products are not small: a deliverable count times a
+    share price times a contract count reaches about 1e18 against a limit of
+    9.2e18. Signed integer overflow is undefined behaviour, and in practice it wraps
+    to a plausible-looking NEGATIVE number rather than failing, which in a ledger
+    whose exactness is the central invariant is the worst possible outcome.
+    """
+
+    HUGE = 2 ** 62
+
+    def test_a_product_that_fits_is_returned_exactly(self):
+        assert E.Money.scaled(1_000_000, 100).micros == 100_000_000
+
+    def test_a_product_that_overflows_raises(self):
+        with pytest.raises(OverflowError, match="exceeds int64"):
+            E.Money.scaled(self.HUGE, 8)
+
+    def test_the_wrapped_value_would_have_been_negative(self):
+        """
+        What the guard prevents. 2^62 * 8 wraps to 0 in two's complement, and
+        2^62 * 3 wraps negative -- either would have been carried into a balance.
+        """
+        assert (self.HUGE * 3) % 2 ** 64 >= 2 ** 63     # wraps to a negative int64
+        with pytest.raises(OverflowError):
+            E.Money.scaled(self.HUGE, 3)
+
+    def test_multiplication_by_a_negative_count_is_still_checked(self):
+        with pytest.raises(OverflowError):
+            E.Money.scaled(self.HUGE, -8)
+
+    def test_the_public_operator_is_guarded_too(self):
+        """Not just the helper: `money * n` is the form most call sites use."""
+        with pytest.raises(OverflowError):
+            E.Money.from_micros(self.HUGE).times(8)
+
+    def test_scaled_div_multiplies_before_dividing(self):
+        """
+        Dividing first truncates and then amplifies the truncation by the numerator.
+        Two fifths of $10.000001 is $4.0000004, which truncates to $4.000000 -- but
+        dividing first gives 0 and then multiplies it back to nothing.
+        """
+        basis = 10_000_001
+
+        assert E.Money.scaled_div(basis, 2, 5).micros == 4_000_000
+        assert (basis // 5) * 2 == 4_000_000       # the same here
+        # Where it differs: a numerator larger than the denominator's remainder.
+        assert E.Money.scaled_div(7, 3, 5).micros == 4
+        assert (7 // 5) * 3 == 3                   # divide-first loses a microdollar
+
+    def test_scaled_div_checks_the_product_before_dividing(self):
+        with pytest.raises(OverflowError):
+            E.Money.scaled_div(self.HUGE, 8, 2)
+
+    def test_scaled_div_rejects_a_zero_denominator(self):
+        with pytest.raises(ValueError, match="zero denominator"):
+            E.Money.scaled_div(1_000_000, 1, 0)
+
+    def test_a_realistic_worst_case_still_fits(self):
+        """
+        The headroom claim, checked rather than asserted: 10,000 contracts of a
+        1,000-share deliverable on a $10,000 underlying.
+        """
+        notional = E.Money.scaled(E.Money.from_dollars(10_000.0).micros, 1_000 * 10_000)
+
+        assert notional.to_dollars() == pytest.approx(1e11)

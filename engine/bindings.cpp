@@ -33,6 +33,12 @@ PYBIND11_MODULE(obt_engine, m) {
         .def(py::init<>())
         .def_static("from_dollars", &money_from, py::arg("dollars"))
         .def_static("from_micros", [](int64_t u) { return Money{u}; }, py::arg("micros"))
+        .def("times", [](const Money& m, int64_t n) { return m * n; }, py::arg("n"))
+        .def_static("scaled", [](int64_t micros, int64_t n) { return Money::scaled(micros, n); },
+                    py::arg("micros"), py::arg("n"))
+        .def_static("scaled_div", [](int64_t micros, int64_t num, int64_t den) {
+            return Money::scaled_div(micros, num, den);
+        }, py::arg("micros"), py::arg("numerator"), py::arg("denominator"))
         .def_readonly("micros", &Money::micros)
         .def("to_dollars", &Money::to_double)
         .def("__repr__", [](Money m) {

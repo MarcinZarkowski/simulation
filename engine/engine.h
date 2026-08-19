@@ -49,7 +49,7 @@ inline Money automatic_exercise_threshold() { return Money::from_double(0.01); }
 // flat $0.01 against an aggregate payoff would exercise anything a hundredth of
 // a cent per share in the money.
 inline Money aggregate_exercise_threshold(int64_t shares_per_contract) {
-    return Money{automatic_exercise_threshold().micros * shares_per_contract};
+    return Money::scaled(automatic_exercise_threshold().micros, shares_per_contract);
 }
 
 struct RiskLimits {
@@ -599,7 +599,7 @@ private:
         const ApplyFillResult applied = book_.apply(
             cv, EquityKind::Option, -held, mark, multiplier, now_);
         ledger_.post(now_, LedgerEntryKind::CorporateActionCash,
-                     Money{mark.micros * multiplier * held}, cv, 0,
+                     Money::scaled(mark.micros, multiplier * held), cv, 0,
                      "quarantined at last mark: " + why);
 
         record_trade(TradeRecord{
@@ -748,9 +748,9 @@ private:
         }
 
         const int64_t signed_qty = (o.side == OrderSide::Buy) ? o.quantity : -o.quantity;
-        p.gross_cash = Money{-p.fill_price.micros * signed_qty};
+        p.gross_cash = -Money::scaled(p.fill_price.micros, signed_qty);
         p.fees = cfg_.fees.equity_fees(
-            o.side, o.quantity, Money{p.fill_price.micros * o.quantity});
+            o.side, o.quantity, Money::scaled(p.fill_price.micros, o.quantity));
         return true;
     }
 
@@ -887,10 +887,11 @@ private:
 
             const int64_t signed_qty = (o.side == OrderSide::Buy) ? o.quantity : -o.quantity;
             // Cash out for a buy, cash in for a sell.
-            p.gross_cash = Money{-p.fill_price.micros * p.multiplier * signed_qty};
+            p.gross_cash = -Money::scaled(
+                Money::scaled(p.fill_price.micros, p.multiplier).micros, signed_qty);
             p.fees = cfg_.fees.option_fees(
                 o.side, o.quantity,
-                Money{p.fill_price.micros * p.multiplier * o.quantity});
+                Money::scaled(p.fill_price.micros, p.multiplier * o.quantity));
 
             plan.push_back(p);
             leg_index++;
@@ -932,8 +933,8 @@ private:
             const bool was_short = existing && existing->quantity < 0;
 
             const Money fill_spread_cost =
-                Money{p.half_spread.micros * (signed_qty < 0 ? -signed_qty : signed_qty)
-                      * p.multiplier};
+                Money::scaled(p.half_spread.micros, (signed_qty < 0 ? -signed_qty : signed_qty)
+                      * p.multiplier);
             const ApplyFillResult applied = book_.apply(
                 p.order.contract_version_id, EquityKind::Option, signed_qty,
                 p.fill_price, p.multiplier, now_, p.fees, fill_spread_cost);
@@ -1047,7 +1048,7 @@ private:
                 const int64_t qty = p.abs_quantity();
                 contracts_by_underlying[c->underlying_symbol] += qty;
                 notional_by_underlying[c->underlying_symbol] +=
-                    Money{c->notional(underlying_of(c->underlying_symbol)).micros * qty};
+                    Money::scaled(c->notional(underlying_of(c->underlying_symbol)).micros, qty);
                 const OptionAnalytics* a = analytics_for(p.contract_version_id);
                 if (a != nullptr && a->valid) abs_delta += a->delta * p.quantity;
             }
@@ -1114,7 +1115,7 @@ private:
     Money probe_equity_value(const PositionBook& book) const {
         Money total = Money::zero();
         for (const EquityPosition& e : book.equity_snapshot())
-            total += Money{underlying_of(e.symbol).micros * e.shares};
+            total += Money::scaled(underlying_of(e.symbol).micros, e.shares);
         return total;
     }
 
@@ -1125,10 +1126,10 @@ private:
         for (const Position& p : book.snapshot()) {
             const OptionContractVersion* c = registry().find(p.contract_version_id);
             const int64_t mult = c ? c->quote_multiplier : 100;
-            total += Money{mark_for(p.contract_version_id).micros * mult * p.quantity};
+            total += Money::scaled(mark_for(p.contract_version_id).micros, mult * p.quantity);
         }
         for (const EquityPosition& e : book.equity_snapshot())
-            total += Money{underlying_of(e.symbol).micros * e.shares};
+            total += Money::scaled(underlying_of(e.symbol).micros, e.shares);
         return total;
     }
 
@@ -1137,10 +1138,10 @@ private:
         for (const Position& p : book_.snapshot()) {
             const OptionContractVersion* c = registry().find(p.contract_version_id);
             const int64_t mult = c ? c->quote_multiplier : 100;
-            total += Money{mark_for(p.contract_version_id).micros * mult * p.quantity} - p.cost_basis;
+            total += Money::scaled(mark_for(p.contract_version_id).micros, mult * p.quantity) - p.cost_basis;
         }
         for (const EquityPosition& e : book_.equity_snapshot())
-            total += Money{underlying_of(e.symbol).micros * e.shares} - e.cost_basis;
+            total += Money::scaled(underlying_of(e.symbol).micros, e.shares) - e.cost_basis;
         return total;
     }
 
@@ -1239,7 +1240,7 @@ private:
     // that does not trade.
     void settle_in_cash(const OptionContractVersion& c, int64_t contracts, Money spot) {
         const int64_t count = contracts < 0 ? -contracts : contracts;
-        const Money intrinsic = Money{c.payoff_at(spot).micros * count};
+        const Money intrinsic = Money::scaled(c.payoff_at(spot).micros, count);
         const bool long_position = contracts > 0;
         ledger_.post(now_, LedgerEntryKind::CashSettlement,
                      long_position ? intrinsic : -intrinsic, c.id, 0,
@@ -1259,7 +1260,7 @@ private:
         const int64_t shares = c.deliverable_shares_per_contract() * count;
         // The aggregate exercise price is the listed strike times the quote
         // multiplier, not the strike times the delivered share count.
-        const Money strike_cash = Money{c.aggregate_exercise_price().micros * count};
+        const Money strike_cash = Money::scaled(c.aggregate_exercise_price().micros, count);
 
         const bool long_position = contracts > 0;
         const bool call = c.type == OptionType::Call;
@@ -1286,7 +1287,7 @@ private:
             ledger_.post(now_, LedgerEntryKind::Fee, -fee, c.id, 0, "exercise/assignment fee");
 
         if (!c.deliverable_cash.is_zero()) {
-            const Money extra = Money{c.deliverable_cash.micros * (contracts < 0 ? -contracts : contracts)};
+            const Money extra = Money::scaled(c.deliverable_cash.micros, (contracts < 0 ? -contracts : contracts));
             ledger_.post(now_, LedgerEntryKind::CashSettlement,
                          receives_shares ? extra : -extra, c.id, 0, "deliverable cash component");
         }
@@ -1355,10 +1356,10 @@ private:
 
             const Money intrinsic = c->payoff_at(spot_it->second);
             if (intrinsic.is_zero()) continue;
-            const Money aggregate_mark = Money{mark_it->second.micros * c->quote_multiplier};
+            const Money aggregate_mark = Money::scaled(mark_it->second.micros, c->quote_multiplier);
             const Money extrinsic = aggregate_mark - intrinsic;
             const Money dividend =
-                Money{d.amount_per_share.micros * c->deliverable_shares_per_contract()};
+                Money::scaled(d.amount_per_share.micros, c->deliverable_shares_per_contract());
             if (extrinsic >= dividend) continue;
 
             const int64_t assigned = p.abs_quantity();
@@ -1387,7 +1388,7 @@ private:
         if (shares == 0) return;
         accruals_.push_back(DividendAccrual{
             d.underlying_symbol,
-            Money{d.amount_per_share.micros * shares},
+            Money::scaled(d.amount_per_share.micros, shares),
             shares, d.ex_date, d.pay_date,
         });
     }

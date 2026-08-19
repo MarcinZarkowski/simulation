@@ -120,8 +120,9 @@ inline Money max_potential_loss(const std::vector<SignedLeg>& legs) {
         Money net = Money::zero();
         for (const SignedLeg& leg : legs) {
             const Money value = intrinsic_at(*leg.contract, point.contract->strike);
-            net += Money{value.micros * leg.contract->deliverable_shares_per_contract()
-                         * leg.quantity};
+            net += Money::scaled(
+                value.micros,
+                leg.contract->deliverable_shares_per_contract() * leg.quantity);
         }
         if (net < worst) worst = net;
     }
@@ -153,7 +154,7 @@ inline Money reg_t_naked_requirement(
                                                             : scale(strike, 0.10);
     const Money per_share = max_money(max_money(primary, floor_amount), Money::zero())
                           + premium_per_share;
-    return Money{per_share.micros * shares};
+    return Money::scaled(per_share.micros, shares);
 }
 
 // Pairs each short option with the long option that best offsets it.
@@ -240,7 +241,7 @@ inline std::vector<SpreadPairing> pair_legs(
             p.contracts = paired;
             // Pairwise residual, kept for reporting. The charged amount comes
             // from joint max-loss netting, which is smaller when wings offset.
-            p.requirement = Money{best_residual.micros * shares * paired};
+            p.requirement = Money::scaled(best_residual.micros, shares * paired);
             out.push_back(p);
             if (matched != nullptr) {
                 matched->push_back(SignedLeg{s.contract, -paired});
@@ -339,13 +340,13 @@ inline MarginResult evaluate_with(
         if (e.shares == 0) continue;
         const Money spot = ctx.underlying_or_zero(e.symbol);
         if (e.shares > 0) {
-            res.requirement += scale(Money{spot.micros * e.shares}, rules.long_stock_fraction);
+            res.requirement += scale(Money::scaled(spot.micros, e.shares), rules.long_stock_fraction);
         } else {
             if (!rules.allow_short_stock) {
                 res.disallowed = true;
                 res.disallowed_reason = rules.short_stock_refusal;
             }
-            res.requirement += scale(Money{spot.micros * (-e.shares)},
+            res.requirement += scale(Money::scaled(spot.micros, (-e.shares)),
                                      rules.short_stock_fraction);
         }
     }
@@ -388,9 +389,8 @@ inline MarginResult evaluate_with(
                         res.disallowed_reason = refusal;
                         break;
                     case NakedPolicy::RegTMinimum:
-                        p.requirement = Money{
-                            detail::reg_t_naked_requirement(
-                                *c, spot, ctx.mark_or_zero(p.short_leg)).micros * p.contracts};
+                        p.requirement = detail::reg_t_naked_requirement(
+                            *c, spot, ctx.mark_or_zero(p.short_leg)) * p.contracts;
                         res.requirement += p.requirement;
                         break;
                     case NakedPolicy::FullStrike:

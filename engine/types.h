@@ -55,8 +55,38 @@ struct Money {
     Money& operator+=(Money o) { micros += o.micros; return *this; }
     Money& operator-=(Money o) { micros -= o.micros; return *this; }
 
-    // Scaling by a contract count or share amount stays exact.
-    Money operator*(int64_t n) const { return Money{micros * n}; }
+    // Scaling by a contract count or share amount stays exact, and is checked.
+    //
+    // Every money product in the engine goes through here. Headroom is large --
+    // int64 microdollars top out near $9.2e12 -- but the products are not small: a
+    // deliverable count times a share price times a contract count reaches ~1e18
+    // against a limit of 9.2e18, and int64 overflow is undefined behaviour that
+    // wraps to a plausible-looking negative number rather than failing. A ledger
+    // whose exactness is the central invariant cannot have a silent wrap in it.
+    Money operator*(int64_t n) const { return scaled(micros, n); }
+
+    // Checked micros * n. Named rather than inline at every call site so the guard
+    // exists in one place.
+    static Money scaled(int64_t micros_value, int64_t n) {
+        int64_t product = 0;
+        if (__builtin_mul_overflow(micros_value, n, &product))
+            throw std::overflow_error("Money: product exceeds int64 microdollars");
+        return Money{product};
+    }
+
+    // Checked micros * numerator / denominator, in that order.
+    //
+    // The order is the point. Dividing first truncates and then amplifies the
+    // truncation by the numerator; multiplying first leaves the whole remainder in
+    // one place, which is what lets a sequence of partial closes sum back to the
+    // exact total. A separate name rather than a fluent chain, because writing it as
+    // scaled(...).micros / d reads as an afterthought and got the operator
+    // precedence wrong once already.
+    static Money scaled_div(int64_t micros_value, int64_t numerator, int64_t denominator) {
+        if (denominator == 0)
+            throw std::invalid_argument("Money::scaled_div: zero denominator");
+        return Money{scaled(micros_value, numerator).micros / denominator};
+    }
 
     bool operator<(Money o) const { return micros < o.micros; }
     bool operator<=(Money o) const { return micros <= o.micros; }

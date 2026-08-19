@@ -91,7 +91,7 @@ public:
 
         ApplyFillResult out;
         // Cash value of one unit of quantity.
-        const Money unit_value = Money{price_per_unit.micros * multiplier};
+        const Money unit_value = Money::scaled(price_per_unit.micros, multiplier);
 
         const bool opposing = (p.quantity > 0 && signed_qty < 0) || (p.quantity < 0 && signed_qty > 0);
         if (opposing) {
@@ -104,14 +104,14 @@ public:
             // once a position was built at more than one price, which is why
             // single-price tests never saw it. Dividing once leaves the remainder
             // in cost_basis, where the final close releases it exactly.
-            const Money released = Money{p.cost_basis.micros * closable / p.abs_quantity()};
+            const Money released = Money::scaled_div(p.cost_basis.micros, closable, p.abs_quantity());
             // Proceeds of the closing trade, signed against the position.
-            const Money proceeds = Money{unit_value.micros * (p.quantity > 0 ? closable : -closable)};
+            const Money proceeds = Money::scaled(unit_value.micros, (p.quantity > 0 ? closable : -closable));
 
             // Entry-side costs release on the same proportion as the basis.
-            const Money released_fees = Money{p.open_fees.micros * closable / p.abs_quantity()};
+            const Money released_fees = Money::scaled_div(p.open_fees.micros, closable, p.abs_quantity());
             const Money released_spread =
-                Money{p.open_spread_cost.micros * closable / p.abs_quantity()};
+                Money::scaled_div(p.open_spread_cost.micros, closable, p.abs_quantity());
             p.open_fees -= released_fees;
             p.open_spread_cost -= released_spread;
 
@@ -124,8 +124,8 @@ public:
             const int64_t total = signed_qty < 0 ? -signed_qty : signed_qty;
             // A fill that crosses through zero splits its own cost between the
             // part that closed and the part that opened.
-            const Money closing_fees = Money{fees.micros * closable / total};
-            const Money closing_spread = Money{spread_cost.micros * closable / total};
+            const Money closing_fees = Money::scaled_div(fees.micros, closable, total);
+            const Money closing_spread = Money::scaled_div(spread_cost.micros, closable, total);
             out.round_trip_fees = released_fees + closing_fees;
             out.round_trip_spread_cost = released_spread + closing_spread;
 
@@ -133,7 +133,7 @@ public:
             if (remainder > 0) {
                 const int64_t dir = signed_qty > 0 ? 1 : -1;
                 p.quantity += dir * remainder;
-                p.cost_basis += Money{unit_value.micros * dir * remainder};
+                p.cost_basis += Money::scaled(unit_value.micros, dir * remainder);
                 p.open_fees += fees - closing_fees;
                 p.open_spread_cost += spread_cost - closing_spread;
                 out.opened_quantity = remainder;
@@ -141,7 +141,7 @@ public:
             }
         } else {
             p.quantity += signed_qty;
-            p.cost_basis += Money{unit_value.micros * signed_qty};
+            p.cost_basis += Money::scaled(unit_value.micros, signed_qty);
             p.open_fees += fees;
             p.open_spread_cost += spread_cost;
             out.opened_quantity = signed_qty < 0 ? -signed_qty : signed_qty;
@@ -198,8 +198,8 @@ public:
                 held, signed_shares < 0 ? -signed_shares : signed_shares);
             const int64_t dir = e.shares > 0 ? 1 : -1;
             // Same single-division release as the option path.
-            const Money released = Money{e.cost_basis.micros * closable / held};
-            const Money proceeds = Money{price.micros * dir * closable};
+            const Money released = Money::scaled_div(e.cost_basis.micros, closable, held);
+            const Money proceeds = Money::scaled(price.micros, dir * closable);
             e.realized_pnl += proceeds - released;
             e.cost_basis -= released;
             e.shares -= dir * closable;
@@ -207,11 +207,11 @@ public:
             if (remainder > 0) {
                 const int64_t open_dir = signed_shares > 0 ? 1 : -1;
                 e.shares += open_dir * remainder;
-                e.cost_basis += Money{price.micros * open_dir * remainder};
+                e.cost_basis += Money::scaled(price.micros, open_dir * remainder);
             }
         } else {
             e.shares += signed_shares;
-            e.cost_basis += Money{price.micros * signed_shares};
+            e.cost_basis += Money::scaled(price.micros, signed_shares);
         }
         if (e.shares == 0) {
             equity_realized_closed_ += e.realized_pnl;

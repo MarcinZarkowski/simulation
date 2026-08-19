@@ -91,7 +91,7 @@ struct Fill {
     Money net_cash{};     // what actually hit the ledger
 
     Money spread_cost() const {
-        return Money{half_spread.micros * quantity * multiplier};
+        return Money::scaled(half_spread.micros, quantity * multiplier);
     }
 
     int64_t multiplier = 100;
