@@ -23,3 +23,9 @@ dev = [
     "pytest>=9.1.1",
     "setuptools>=84.0.0",
 ]
+
+[tool.pytest.ini_options]
+# Collect only the maintained suite. The repo root still holds scripts from the
+# previous implementation that import a module which no longer exists, so an
+# unscoped run fails at collection rather than on any real defect.
+testpaths = ["tests"]
