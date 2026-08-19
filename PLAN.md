@@ -76,8 +76,8 @@ Verified by reading the code and running it.
 - **Bounded mark staleness.** A carried-forward mark past its age limit falls back
   to intrinsic against a fresh spot, and the oldest mark behind any valuation is
   reported.
-- **639 tests**, including an independent Python reference engine that agrees to
-  the microdollar, and Monte Carlo property tests covering all eight required
+- **773 tests** at a **68.2% mutation score** on the C++ engine, including an
+  independent Python reference engine that agrees to the microdollar, and Monte Carlo property tests covering all eight required
   properties.
 
 ### Measured cost
@@ -148,12 +148,9 @@ a plan that only ever grows is not a plan.
 | M-a | **Spread cost is uncalibrated.** The pipeline supplies no quotes, so the default `conditional_lognormal` parameters are illustrative | `engine/spread.h` defaults; the pipeline's schema has no bid/ask | Confidence intervals describe an assumed distribution, not execution. The report says so and the `--spread-variance-scale` knob exists to size the exposure, but a number that reads as ±$3 could be ±$300. **The single most important open item**, and it is gated on the pipeline's B1. |
 | M-b | **Margin is not broker-validated.** It follows published FINRA/Cboe/Robinhood rules and has been checked against Robinhood's own help centre and fee schedule, but never against a broker statement | — | Robinhood's house requirements range 25–100% and are model-driven and undisclosed. Requirements are a defensible approximation of the published rules, not a match to an account. |
 | M-c | **Robinhood's expiration-day closeout is not modelled.** The real broker closes at-risk expiring positions from 3:30 PM ET | — | The engine holds to expiry and settles, which the real account often would not. The "at-risk" band is undisclosed, so this is a parameter to expose, not a rule to implement. |
-| M-d | **Bracket and OCO orders are absent, and exercise is not submittable.** Rolls are expressible as an atomic group; a stop-loss bracket is not | `engine/order.h` | `AssignmentPolicy::ExplicitExerciseOnly` is selectable but a strategy has no way to submit an exercise, so choosing it makes the engine never settle anything. Either implement it or make the policy unselectable. |
-| M-e | **`config_sha256` does not cover everything that changes a result** — spread calibration, risk limits, the universe filter, strategy parameters, and the engine source itself are all outside it | `optionsbacktester/runner.py` | Two runs can report the same config hash and different numbers, which is worse than no hash. |
-| M-f | **`build_bars` and `build_analytics` iterate per row in Python.** They are the hot path | `optionsbacktester/contracts.py` | Throughput is CPU-bound in Python at ~26k rows/s. A ticker-year at 1,000 paths is hours. Vectorising the frame-to-struct conversion is the largest available win. |
-| M-g | **`equity_curve_`, `fills_`, `rejections_` and `trades_` accumulate without bound** | `engine/engine.h` | Memory is linear in bars × paths for the record vectors even though the registry is now shared. A long run at high path count will grow steadily. |
-| M-h | **No golden end-to-end replay.** Nothing pins a full run's numbers against a stored expectation | `tests/` | A refactor that changes every P&L by a cent passes. |
-| M-i | **Mutation score is not measured.** Individual fixes in this repo are mutation-verified one at a time; the suite as a whole is not scored | — | "639 tests" is a count, not evidence. A target of ≥80% killed on the accounting and settlement paths would be. |
+| M-d | **Bracket and OCO orders are absent.** Rolls and buy-writes are expressible as atomic groups; a stop-loss bracket is not | `engine/order.h` | A strategy cannot express "exit at a loss OR a target, whichever comes first" in one submission. Exercise IS now submittable, so `ExplicitExerciseOnly` settles what a strategy tells it to. |
+| M-f | **Throughput is CPU-bound in Python at ~25-30k rows/s** | `optionsbacktester/contracts.py`, `stream.py` | A ticker-year at 1,000 paths is hours. This entry previously called the per-row builders "the hot path" and "the largest available win"; profiling says otherwise -- they were about 11% of a run, and the Polars reading layer was the largest single cost. Merging three passes into one and caching the per-file schema together bought 13%. The remaining win is moving the per-bar loop itself into C++, which is a large refactor rather than an optimisation. |
+| M-i | **Mutation score is 68.2%**, short of the ≥80% target | `scripts/mutation_score.py` | Measured over two rounds: 53.8% (21/39 valid) first, then 68.2% (15/22) after closing the real survivors. Non-compiling mutants are excluded rather than counted as kills, since the compiler rejecting a change says nothing about whether a test would have. The remaining survivors are dominated by equivalent mutants -- `>` to `>=` where the value can never be zero -- so raising the number further needs a smarter operator set as much as more tests. |
 
 ### MINOR — still open
 
@@ -198,6 +195,9 @@ mutation testing on a single change rather than a suite-wide score.
 | E-4 | `PortfolioApprox` returned a plain Reg-T model while the manifest recorded `portfolio_approx` — a reproducibility artifact naming a methodology the run had not applied | Deleted. Robinhood does not offer portfolio margin at all; its long-option maintenance requirement of 100% is incompatible with it |
 | E-7 | The audit claimed this model over-refuses, permitting short strangles at Level 3 | **The audit was wrong.** Robinhood publishes two levels, neither permits an uncovered short call, and the Level 3 menu contains no short strangle or straddle. Tests now name the source so it does not get "fixed" back |
 | H-1 | Each engine held its own contract registry; 100 engines over 8,000 contracts cost 180 MiB, extrapolating to ~1.8 GiB at 1,000 paths | One shared registry. 0.0 MiB, and the per-day re-set is gone |
+| M-e | `config_sha256` covered only the manifest's summary fields, so two runs with different spread calibrations, risk limits, fail-closed gates, universe filters or strategy parameters reported the SAME hash and different numbers -- worse than no hash, since it asserts equivalence | 61 config leaves fingerprinted on the C++ side, plus the universe filter, opt-in strategy parameters, and a hash of the compiled extension. Fourteen things now change it that did not |
+| M-g | Per-path record vectors grew without bound: 7.1 GB of equity points at 1,000 paths for a ticker-year, plus 0.79 GB in a vector that duplicated one field and had no consumer | Session-resolution curve (390x smaller, and the exact scalars are unaffected), a retention cap with the dropped count reported, and the duplicate vector deleted |
+| M-h | Nothing pinned a full run's numbers, so a refactor shifting every P&L by a cent passed all 705 tests | A golden replay over a poor man's covered call, compared in microdollars as integers, with seven tests keeping the replay itself worth having |
 | J-3 | A contract that stopped printing kept its last mark forever, valuing the book and setting margin off a price of any age | Bounded; falls back to intrinsic against a fresh spot; the oldest mark behind a valuation is reported |
 | — | A round trip recorded only its CLOSING leg's fees and spread, so per-trade cost read at roughly half what the path paid ($5.58 against $10.02) | Entry costs release proportionally with the basis. Now exact on both |
 | — | Dividends did not exist in the engine at all, so a covered call understated its return by the entire yield | Accrued at ex-date, paid at pay date, gated on declaration, owed on short shares |
@@ -226,8 +226,7 @@ that used defaults says so in its manifest.
 
 ### Phase 2 — Finish the order model  *(weeks)*
 
-- **M-d.** Bracket and OCO groups; exercise as a submittable order so
-  `ExplicitExerciseOnly` means something.
+- **M-d.** Bracket and OCO groups.
 - **M-c.** Expose Robinhood's expiration-day closeout as a configurable band
   rather than pretending the account holds to expiry.
 
@@ -235,12 +234,10 @@ that used defaults says so in its manifest.
 
 ### Phase 3 — Earn the trust  *(weeks)*
 
-- **M-e.** Extend `config_sha256` to cover spread calibration, risk limits, the
-  universe filter, strategy parameters and a hash of the engine source.
-- **M-h.** A golden end-to-end replay: a fixed lake, a fixed seed, stored
-  expected numbers.
-- **M-i.** Measure the mutation score on the accounting, margin and settlement
-  paths. Target ≥80% killed. Publish the figure rather than the test count.
+- **M-i.** Raise the mutation score from 68.2% toward ≥80%. The cheap survivors are
+  gone; what remains needs an operator set that recognises equivalent mutants (a
+  boundary change where the value cannot reach the boundary) so the denominator stops
+  being diluted by changes with no detectable behaviour.
 - **M-b.** Reconcile one real account statement against the model, and record
   every divergence as either a fix or a stated limitation.
 
@@ -250,7 +247,6 @@ that used defaults says so in its manifest.
 
 - **M-f.** Vectorise `build_bars` and `build_analytics`. This is the largest
   single throughput win available.
-- **M-g.** Bound or stream the per-path record vectors.
 - Raise the CI budgets as they improve, so the ceiling always tracks reality.
 
 **Done when:** a ticker-year at 1,000 paths is measured, bounded, and enforced.
