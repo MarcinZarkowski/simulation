@@ -106,6 +106,11 @@ PYBIND11_MODULE(obt_engine, m) {
         .value("ACCELERATED_EXPIRATION", AdjustmentType::AcceleratedExpiration)
         .value("UNKNOWN", AdjustmentType::Unknown);
 
+    py::enum_<TermsProvenance>(m, "TermsProvenance")
+        .value("POINT_IN_TIME", TermsProvenance::PointInTime)
+        .value("BACKFILLED", TermsProvenance::Backfilled)
+        .value("UNKNOWN", TermsProvenance::Unknown);
+
     py::enum_<SettlementRule>(m, "SettlementRule")
         .value("PHYSICAL_DELIVERY", SettlementRule::PhysicalDelivery)
         .value("CASH_SETTLEMENT", SettlementRule::CashSettlement)
@@ -144,6 +149,14 @@ PYBIND11_MODULE(obt_engine, m) {
         .def_property("valid_to",
             [](const OptionContractVersion& c) { return c.valid_to.epoch_ns; },
             [](OptionContractVersion& c, int64_t v) { c.valid_to = Timestamp{v}; })
+        .def_property("source_available_at",
+            [](const OptionContractVersion& c) { return c.source_available_at.epoch_ns; },
+            [](OptionContractVersion& c, int64_t v) { c.source_available_at = Timestamp{v}; })
+        .def_readwrite("terms_provenance", &OptionContractVersion::terms_provenance)
+        .def("known_at", [](const OptionContractVersion& c, int64_t t) {
+            return c.known_at(Timestamp{t});
+        }, py::arg("timestamp_ns"))
+        .def("terms_inferred_from_future", &OptionContractVersion::terms_inferred_from_future)
         .def_property("expiration",
             [](const OptionContractVersion& c) { return c.expiration.epoch_ns; },
             [](OptionContractVersion& c, int64_t v) { c.expiration = Timestamp{v}; })
@@ -424,7 +437,8 @@ PYBIND11_MODULE(obt_engine, m) {
         .def_readwrite("risk", &BacktestConfig::risk)
         .def_readwrite("require_occ_confirmed_lineage", &BacktestConfig::require_occ_confirmed_lineage)
         .def_readwrite("reject_fallback_analytics", &BacktestConfig::reject_fallback_analytics)
-        .def_readwrite("reject_stale_bars", &BacktestConfig::reject_stale_bars);
+        .def_readwrite("reject_stale_bars", &BacktestConfig::reject_stale_bars)
+        .def_readwrite("require_point_in_time_terms", &BacktestConfig::require_point_in_time_terms);
 
     py::class_<PathMetrics>(m, "PathMetrics")
         .def_readonly("scenario_id", &PathMetrics::scenario_id)

@@ -47,15 +47,63 @@ def _float(row: dict, name: str, default: float) -> float:
     return default if value is None else float(value)
 
 
-def build_contracts(options: pl.DataFrame, underlying_symbol: str) -> dict[int, E.OptionContractVersion]:
+_PROVENANCE = {
+    "point_in_time_snapshot": E.TermsProvenance.POINT_IN_TIME,
+    "later_snapshot_backfilled": E.TermsProvenance.BACKFILLED,
+}
+
+
+def _version_timing(versions: pl.DataFrame) -> dict[int, tuple[int, int, object]]:
+    """
+    ``(valid_from, source_available_at, terms_provenance)`` per version key, from
+    ``option_contract_version.parquet``.
+
+    Keyed on the same terms tuple the engine uses rather than on the pipeline's own
+    ``contract_version_id``, because the two are independent hashes over different
+    string encodings and will not agree.
+    """
+    needed = ("symbol", "strike", "deliverable_equity_amount", "quote_multiplier")
+    if versions.is_empty() or any(c not in versions.columns for c in needed):
+        return {}
+
+    out: dict[int, tuple[int, int, object]] = {}
+    for row in versions.iter_rows(named=True):
+        key = contract_version_key(
+            row["symbol"], _float(row, "strike", 0.0),
+            _float(row, "deliverable_equity_amount", 100.0),
+            _float(row, "quote_multiplier", 100.0),
+        )
+        valid_from = row.get("valid_from")
+        available = row.get("source_available_at")
+        out[key] = (
+            to_ns(valid_from) if valid_from else 0,
+            to_ns(available) if available else 0,
+            _PROVENANCE.get(row.get("terms_provenance"), E.TermsProvenance.UNKNOWN),
+        )
+    return out
+
+
+def build_contracts(
+    options: pl.DataFrame,
+    underlying_symbol: str,
+    versions: pl.DataFrame | None = None,
+) -> dict[int, E.OptionContractVersion]:
     """
     One contract version per distinct set of terms seen in the frame.
 
     Deduplicated on the version key, so a contract quoted across 390 minutes
     produces one struct rather than 390.
+
+    ``versions`` is the pipeline's ``option_contract_version`` frame. It supplies
+    the point-in-time fields the bars frame does not carry -- when terms took
+    effect, when they became knowable, and whether they were observed at the time
+    or copied from a later snapshot. Without it every version is un-provenanced,
+    and the engine refuses to open a position on an adjusted contract whose terms
+    it cannot establish.
     """
     if options.is_empty():
         return {}
+    timing = _version_timing(versions if versions is not None else pl.DataFrame())
 
     wanted = [
         "symbol", "strike", "pricing_strike", "flag", "expiration",
@@ -105,7 +153,15 @@ def build_contracts(options: pl.DataFrame, underlying_symbol: str) -> dict[int, 
         c.analytics_supported = priced
 
         c.expiration = to_ns(expiration)
-        c.valid_from = 0
+        # From the reference frame when we have it. The fallback is the epoch,
+        # which asserts the terms held forever and were always knowable -- true
+        # enough for an unadjusted contract, and refused for an adjusted one by
+        # the provenance gate rather than by silently trusting it.
+        valid_from, available_at, provenance = timing.get(
+            key, (0, 0, E.TermsProvenance.UNKNOWN))
+        c.valid_from = valid_from
+        c.source_available_at = available_at
+        c.terms_provenance = provenance
         c.valid_to = c.expiration
         out[key] = c
     return out

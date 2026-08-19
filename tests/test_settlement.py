@@ -613,3 +613,95 @@ class TestAdjustedAggregateExercisePrice:
         assert E.aggregate_exercise_threshold(100) == pytest.approx(1.00)
         assert E.aggregate_exercise_threshold(50) == pytest.approx(0.50)
         assert E.aggregate_exercise_threshold(400) == pytest.approx(4.00)
+
+
+class TestPointInTimeContractTerms:
+    """
+    The engine gates fills on ``covers(now)``, but the loader used to hardcode
+    ``valid_from = 0`` on every version, so the lower half of that gate never
+    fired: an adjusted version discovered on day 100 was asserted valid from the
+    epoch and could be traded on day 1 at terms that did not exist yet.
+    """
+
+    def _contract(self, **kwargs):
+        return make_contract(1, strike=STRIKE, expiry_day=EXPIRY_DAY,
+                             multiplier=50, deliverable_shares=50, **kwargs)
+
+    def _trade(self, contract, config=None):
+        h = EngineHarness(config or base_config(), [contract])
+        for day, groups in ((SIGNAL_DAY, [group(buy(1, 1))]), (FILL_DAY, [])):
+            h.bar(day_ns(day), [make_bar(1, timestamp_ns=day_ns(day), price=PREMIUM)],
+                  groups=groups)
+        return h
+
+    def test_terms_not_yet_in_effect_are_refused(self):
+        c = self._contract()
+        c.valid_from = day_ns(EXPIRY_DAY - 1)
+        h = self._trade(c)
+        assert h.quantity_of(1) == 0
+        assert "not valid at fill time" in h.rejections()[0].detail
+
+    def test_terms_already_in_effect_fill(self):
+        c = self._contract()
+        c.valid_from = day_ns(0)
+        c.terms_provenance = E.TermsProvenance.POINT_IN_TIME
+        assert self._trade(c).quantity_of(1) == 1
+
+    def test_terms_published_after_the_bar_are_refused(self):
+        """
+        Effect and knowledge are separate. An OCC adjustment memo is published
+        after the fact, so acting on the adjusted terms at the effective instant
+        uses information the participant did not have.
+        """
+        c = self._contract()
+        c.terms_provenance = E.TermsProvenance.POINT_IN_TIME
+        c.source_available_at = day_ns(FILL_DAY + 1)
+        h = self._trade(c)
+        assert h.quantity_of(1) == 0
+        assert "not published until after this bar" in h.rejections()[0].detail
+
+    def test_backfilled_adjusted_terms_cannot_open_a_position(self):
+        c = self._contract(is_adjusted=True)
+        c.terms_provenance = E.TermsProvenance.BACKFILLED
+        h = self._trade(c)
+        assert h.quantity_of(1) == 0
+        assert "not established as point-in-time" in h.rejections()[0].detail
+
+    def test_unknown_provenance_on_an_adjusted_contract_fails_closed(self):
+        """No provenance record is treated as unjustified, not as fine."""
+        c = self._contract(is_adjusted=True)
+        c.terms_provenance = E.TermsProvenance.UNKNOWN
+        assert self._trade(c).quantity_of(1) == 0
+
+    def test_backfilled_terms_on_an_unadjusted_contract_are_fine(self):
+        """
+        A later snapshot reports the same listed strike and deliverable for a
+        contract nothing happened to, so backfilling it is not hindsight.
+        """
+        c = self._contract(is_adjusted=False)
+        c.terms_provenance = E.TermsProvenance.BACKFILLED
+        assert self._trade(c).quantity_of(1) == 1
+
+    def test_the_gate_is_configurable(self):
+        c = self._contract(is_adjusted=True)
+        c.terms_provenance = E.TermsProvenance.BACKFILLED
+        cfg = base_config()
+        cfg.require_point_in_time_terms = False
+        assert self._trade(c, cfg).quantity_of(1) == 1
+
+    def test_an_existing_position_can_still_be_closed(self):
+        """
+        Refusing the exit would be a worse distortion than the hindsight: the
+        position exists either way, and trapping it misstates the account.
+        """
+        c = self._contract(is_adjusted=True)
+        c.terms_provenance = E.TermsProvenance.POINT_IN_TIME
+        h = self._trade(c)
+        assert h.quantity_of(1) == 1
+        # The adjustment lands, and from here the terms are only backfilled.
+        c.terms_provenance = E.TermsProvenance.BACKFILLED
+        for day in (FILL_DAY + 1, FILL_DAY + 2):
+            bars = [make_bar(1, timestamp_ns=day_ns(day), price=PREMIUM)]
+            groups = [group(sell(1, 1, reduce_only=True))] if day == FILL_DAY + 1 else []
+            h.bar(day_ns(day), bars, groups=groups)
+        assert h.quantity_of(1) == 0

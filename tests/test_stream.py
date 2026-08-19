@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import inspect
 import math
-from datetime import date
+from datetime import date, datetime
 
+import obt_engine as E
 import polars as pl
 import pytest
 
@@ -12,6 +13,7 @@ from optionsbacktester.contracts import (
     build_contracts,
     build_snapshot,
     contract_version_key,
+    to_ns,
 )
 from optionsbacktester.stream import (
     OPTION_COLUMNS,
@@ -471,6 +473,42 @@ class TestContractMapping:
         assert by_symbol[unpriced].analytics_supported is False
         assert all(c.tradable_for_new_positions
                    for s, c in by_symbol.items() if s != unpriced)
+
+    def test_point_in_time_fields_come_from_the_reference_frame(self, day):
+        """
+        ``option_contract_version.parquet`` was loaded into ``DaySlice`` and never
+        read, and every version was stamped ``valid_from = 0`` -- so the engine's
+        ``covers(now)`` gate could never reject terms that had not taken effect yet.
+        """
+        row = day.options.head(1)
+        symbol = row["symbol"][0]
+        versions = pl.DataFrame({
+            "symbol": [symbol],
+            "strike": [row["strike"][0]],
+            "deliverable_equity_amount": [100.0],
+            "quote_multiplier": [100.0],
+            "valid_from": [datetime(2024, 1, 2, 14, 30)],
+            "source_available_at": [datetime(2024, 1, 3, 9, 0)],
+            "terms_provenance": ["later_snapshot_backfilled"],
+        })
+
+        contract = next(iter(build_contracts(row, TICKER, versions).values()))
+
+        assert contract.valid_from == to_ns(datetime(2024, 1, 2, 14, 30))
+        assert contract.source_available_at == to_ns(datetime(2024, 1, 3, 9, 0))
+        assert contract.terms_provenance == E.TermsProvenance.BACKFILLED
+
+    def test_a_version_absent_from_the_reference_frame_is_unprovenanced(self, day):
+        """
+        Not an error -- the reference frame is optional -- but it must not read as
+        confirmed point-in-time, or an adjusted contract would slip the gate.
+        """
+        contract = next(iter(build_contracts(day.options.head(1), TICKER).values()))
+
+        assert contract.terms_provenance == E.TermsProvenance.UNKNOWN
+        assert contract.terms_inferred_from_future() is False   # not adjusted
+        contract.is_adjusted = True
+        assert contract.terms_inferred_from_future() is True
 
     def test_one_symbol_with_two_deliverables_maps_to_two_versions(self, day):
         row = day.options.head(1)

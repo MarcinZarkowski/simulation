@@ -225,7 +225,7 @@ def run(
             day_dir = lake.ticker_dir / f"{day.day.year:04d}" / f"{day.day.month:02d}" / f"{day.day.day:02d}"
             files_read.extend(sorted(day_dir.glob("*.parquet")))
 
-        new_contracts = build_contracts(day.options, ticker)
+        new_contracts = build_contracts(day.options, ticker, day.contract_versions)
         contracts.update(new_contracts)
         for contract in new_contracts.values():
             registry.add(contract)

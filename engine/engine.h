@@ -89,6 +89,10 @@ struct BacktestConfig {
     bool require_occ_confirmed_lineage = true;
     bool reject_fallback_analytics = true;
     bool reject_stale_bars = true;
+    // Refuse to OPEN a position on terms the pipeline marked as inferred from a
+    // later snapshot. Closing one is always allowed: the position exists, and
+    // refusing to exit it would be a worse distortion than the hindsight.
+    bool require_point_in_time_terms = true;
 };
 
 // Why a position stopped existing. Distinguishing these matters because a
@@ -598,6 +602,11 @@ private:
             p.contract = registry().find(o.contract_version_id);
             if (p.contract == nullptr) { reason = RejectReason::ContractNotTradable; detail = "unknown contract version"; break; }
             if (!p.contract->covers(now_)) { reason = RejectReason::ContractNotTradable; detail = "contract version not valid at fill time"; break; }
+            if (!p.contract->known_at(now_)) {
+                reason = RejectReason::ContractNotTradable;
+                detail = "contract terms were not published until after this bar";
+                break;
+            }
             if (superseded_versions_.count(o.contract_version_id.value)) {
                 reason = RejectReason::ContractNotTradable;
                 detail = "contract version superseded by a contract adjustment";
@@ -605,6 +614,12 @@ private:
             }
 
             const bool opening = !o.reduce_only;
+            if (opening && cfg_.require_point_in_time_terms
+                && p.contract->terms_inferred_from_future()) {
+                reason = RejectReason::ContractNotTradable;
+                detail = "adjusted contract terms are not established as point-in-time";
+                break;
+            }
             if (opening && !p.contract->tradable_for_new_positions) {
                 reason = RejectReason::ContractNotTradable;
                 detail = "contract not tradable for new positions";

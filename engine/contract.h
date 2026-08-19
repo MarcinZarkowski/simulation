@@ -8,6 +8,16 @@
 
 namespace obt {
 
+// Where a version's terms came from, carried verbatim from the pipeline's
+// terms_provenance column.
+//
+// PointInTime means the terms were observed in a snapshot taken at the time they
+// applied. Backfilled means they were copied from a LATER snapshot, so they
+// describe what the contract turned out to be, not what it was known to be. The
+// pipeline flags this precisely so a consumer can refuse it; the engine used to
+// discard the flag.
+enum class TermsProvenance : uint8_t { PointInTime, Backfilled, Unknown };
+
 // One set of contract terms valid over an explicit interval. Mirrors the
 // pipeline's option_contract_version rows so the engine never has to re-derive
 // pricing terms from raw deliverables.
@@ -20,6 +30,13 @@ struct OptionContractVersion {
     Timestamp valid_from{};
     Timestamp valid_to = Timestamp::never();
     Timestamp expiration{};
+
+    // When these terms became knowable, as distinct from when they took effect.
+    // An OCC adjustment memo is published after the fact, so a backtest that
+    // acts on the adjusted terms at the effective instant is using information
+    // it did not have.
+    Timestamp source_available_at{};
+    TermsProvenance terms_provenance = TermsProvenance::Unknown;
 
     OptionType type = OptionType::Call;
     bool is_american = true;
@@ -43,6 +60,19 @@ struct OptionContractVersion {
 
     bool covers(Timestamp t) const {
         return valid_from <= t && (valid_to.is_never() || t < valid_to);
+    }
+
+    // Whether the terms were available to a participant at this moment.
+    bool known_at(Timestamp t) const { return source_available_at <= t; }
+
+    // Terms not positively established as point-in-time, for a contract whose
+    // economics an adjustment changed. For an unadjusted contract a later snapshot
+    // reports the same listed strike and deliverable, so backfilling it is not
+    // hindsight; for an adjusted one it is exactly hindsight. Unknown provenance
+    // counts as unjustified rather than fine, which is the same fail-closed
+    // posture the lineage gate takes.
+    bool terms_inferred_from_future() const {
+        return is_adjusted && terms_provenance != TermsProvenance::PointInTime;
     }
 
     int64_t deliverable_shares_per_contract() const {
