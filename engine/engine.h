@@ -176,6 +176,10 @@ struct PathMetrics {
     bool truncated = false;
     int64_t quarantined_positions = 0;
     int64_t early_assignment_count = 0;
+    // Cash settlements resolved against an observed spot because no official
+    // settlement value was published. Surfaced rather than hidden: SET and VRO are
+    // computed from opening prints and can differ materially from the last bar.
+    int64_t settlements_without_official_price = 0;
     // Net dividend cash: received on long shares, owed on short.
     Money dividend_cash{};
 };
@@ -187,6 +191,12 @@ struct MarketSnapshot {
     std::vector<MarketBar> bars;
     std::vector<OptionAnalytics> analytics;
     std::unordered_map<std::string, Money> underlying_price;
+    // Official settlement values, keyed by underlying. A cash-settled index series
+    // settles against a published number (SET for SPX, VRO for VIX) computed from
+    // opening or closing prints, not against the last bar anyone happened to see.
+    // Absent means the engine has to fall back to the observed spot, which it
+    // records rather than hides.
+    std::unordered_map<std::string, Money> settlement_price;
 };
 
 struct AccountState {
@@ -640,6 +650,11 @@ private:
             }
 
             const bool opening = !o.reduce_only;
+            if (opening && !p.contract->tradable_at(now_)) {
+                reason = RejectReason::ContractNotTradable;
+                detail = "contract has stopped trading ahead of settlement";
+                break;
+            }
             if (opening && cfg_.require_point_in_time_terms
                 && p.contract->terms_inferred_from_future()) {
                 reason = RejectReason::ContractNotTradable;
@@ -953,18 +968,24 @@ private:
             // price -- measured at +$9,500 of invented profit and a 100-share
             // short -- while a call silently expired worthless. Neither was
             // flagged, so refuse instead.
-            if (!has_observed_underlying(c->underlying_symbol)) {
+            const bool have_official = settlement_price_of(c->underlying_symbol) != nullptr;
+            if (!have_official && !has_observed_underlying(c->underlying_symbol)) {
                 quarantine(p.contract_version_id, p.quantity,
                            "no observed underlying price at settlement");
                 continue;
             }
-            if (c->has_fractional_deliverable()) {
+            // Cash settlement pays the intrinsic and never touches a share
+            // position, so a fractional deliverable is only a problem for physical
+            // delivery -- there is no fraction of a share to owe cash in lieu of.
+            if (!c->is_cash_settled() && c->has_fractional_deliverable()) {
                 quarantine(p.contract_version_id, p.quantity,
                            "fractional deliverable requires cash-in-lieu settlement");
                 continue;
             }
 
-            const Money spot = underlying_of(c->underlying_symbol);
+            const Money spot = settlement_spot(*c);
+            if (c->is_cash_settled() && !have_official)
+                metrics_.settlements_without_official_price++;
             // Per-contract payoff from the actual deliverable, aggregated against
             // the listed strike times the quote multiplier.
             const Money intrinsic = c->payoff_at(spot);
@@ -1001,10 +1022,40 @@ private:
 
             if (!exercise) continue;
 
-            settle_physically(*c, p.quantity, spot);
+            if (c->is_cash_settled()) settle_in_cash(*c, p.quantity, spot);
+            else settle_physically(*c, p.quantity, spot);
             if (p.quantity > 0) metrics_.exercise_count++;
             else metrics_.assignment_count++;
         }
+    }
+
+    const Money* settlement_price_of(const std::string& sym) const {
+        auto it = current_.settlement_price.find(sym);
+        return it == current_.settlement_price.end() ? nullptr : &it->second;
+    }
+
+    // The price settlement is computed against: the official settlement value when
+    // the feed carries one, otherwise the last observed spot.
+    Money settlement_spot(const OptionContractVersion& c) const {
+        const Money* official = settlement_price_of(c.underlying_symbol);
+        return official ? *official : underlying_of(c.underlying_symbol);
+    }
+
+    // Cash settlement, which is how every index series resolves. The holder
+    // receives the intrinsic and no share position is created -- nobody can
+    // deliver an index. settle_physically would have booked shares of a symbol
+    // that does not trade.
+    void settle_in_cash(const OptionContractVersion& c, int64_t contracts, Money spot) {
+        const int64_t count = contracts < 0 ? -contracts : contracts;
+        const Money intrinsic = Money{c.payoff_at(spot).micros * count};
+        const bool long_position = contracts > 0;
+        ledger_.post(now_, LedgerEntryKind::CashSettlement,
+                     long_position ? intrinsic : -intrinsic, c.id, 0,
+                     long_position ? "cash settlement received" : "cash settlement paid");
+
+        const Money fee = long_position ? cfg_.fees.exercise_fee : cfg_.fees.assignment_fee;
+        if (!fee.is_zero())
+            ledger_.post(now_, LedgerEntryKind::Fee, -fee, c.id, 0, "cash settlement fee");
     }
 
     // Physical delivery, which is what actually happens to equity options and
@@ -1097,6 +1148,9 @@ private:
             if (p.kind != EquityKind::Option || p.quantity >= 0) continue;
             const OptionContractVersion* c = registry().find(p.contract_version_id);
             if (c == nullptr || c->type != OptionType::Call) continue;
+            // A European contract cannot be exercised before expiration, so it
+            // cannot be assigned early either.
+            if (!c->is_american) continue;
             if (c->underlying_symbol != d.underlying_symbol) continue;
             // Expiring anyway: the expiration path handles it, with the correct
             // reason and the correct threshold.

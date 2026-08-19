@@ -105,6 +105,10 @@ PYBIND11_MODULE(obt_engine, m) {
         .value("ACCELERATED_EXPIRATION", AdjustmentType::AcceleratedExpiration)
         .value("UNKNOWN", AdjustmentType::Unknown);
 
+    py::enum_<SettlementStyle>(m, "SettlementStyle")
+        .value("PHYSICAL_DELIVERY", SettlementStyle::PhysicalDelivery)
+        .value("CASH_SETTLEMENT", SettlementStyle::CashSettlement);
+
     py::enum_<TermsProvenance>(m, "TermsProvenance")
         .value("POINT_IN_TIME", TermsProvenance::PointInTime)
         .value("BACKFILLED", TermsProvenance::Backfilled)
@@ -152,6 +156,15 @@ PYBIND11_MODULE(obt_engine, m) {
             [](const OptionContractVersion& c) { return c.source_available_at.epoch_ns; },
             [](OptionContractVersion& c, int64_t v) { c.source_available_at = Timestamp{v}; })
         .def_readwrite("terms_provenance", &OptionContractVersion::terms_provenance)
+        .def_readwrite("is_american", &OptionContractVersion::is_american)
+        .def_readwrite("settlement_style", &OptionContractVersion::settlement_style)
+        .def_property("last_trade_at",
+            [](const OptionContractVersion& c) { return c.last_trade_at.epoch_ns; },
+            [](OptionContractVersion& c, int64_t v) { c.last_trade_at = Timestamp{v}; })
+        .def("tradable_at", [](const OptionContractVersion& c, int64_t t) {
+            return c.tradable_at(Timestamp{t});
+        }, py::arg("timestamp_ns"))
+        .def_property_readonly("is_cash_settled", &OptionContractVersion::is_cash_settled)
         .def("known_at", [](const OptionContractVersion& c, int64_t t) {
             return c.known_at(Timestamp{t});
         }, py::arg("timestamp_ns"))
@@ -475,6 +488,8 @@ PYBIND11_MODULE(obt_engine, m) {
         .def_readonly("truncated", &PathMetrics::truncated)
         .def_readonly("quarantined_positions", &PathMetrics::quarantined_positions)
         .def_readonly("early_assignment_count", &PathMetrics::early_assignment_count)
+        .def_readonly("settlements_without_official_price",
+                      &PathMetrics::settlements_without_official_price)
         .def_property_readonly("dividend_cash",
             [](const PathMetrics& m) { return m.dividend_cash.to_double(); })
         .def_property_readonly("dividend_cash_micros",
@@ -574,6 +589,16 @@ PYBIND11_MODULE(obt_engine, m) {
             [](MarketSnapshot& s, const std::unordered_map<std::string, double>& in) {
                 s.underlying_price.clear();
                 for (const auto& [k, v] : in) s.underlying_price[k] = money_from(v);
+            })
+        .def_property("settlement_price",
+            [](const MarketSnapshot& s) {
+                std::unordered_map<std::string, double> out;
+                for (const auto& [k, v] : s.settlement_price) out[k] = v.to_double();
+                return out;
+            },
+            [](MarketSnapshot& s, const std::unordered_map<std::string, double>& in) {
+                s.settlement_price.clear();
+                for (const auto& [k, v] : in) s.settlement_price[k] = money_from(v);
             });
 
     py::class_<SpreadPairing>(m, "SpreadPairing")

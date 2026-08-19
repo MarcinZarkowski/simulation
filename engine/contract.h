@@ -18,6 +18,13 @@ namespace obt {
 // discard the flag.
 enum class TermsProvenance : uint8_t { PointInTime, Backfilled, Unknown };
 
+// How an in-the-money contract resolves at expiration.
+//
+// Equity and ETF options deliver shares. Index options (SPX, XSP, RUT, NDX, VIX)
+// pay the intrinsic in cash and never touch a share position -- delivering the
+// index is not a thing anyone can do.
+enum class SettlementStyle : uint8_t { PhysicalDelivery, CashSettlement };
+
 // One set of contract terms valid over an explicit interval. Mirrors the
 // pipeline's option_contract_version rows so the engine never has to re-derive
 // pricing terms from raw deliverables.
@@ -39,7 +46,20 @@ struct OptionContractVersion {
     TermsProvenance terms_provenance = TermsProvenance::Unknown;
 
     OptionType type = OptionType::Call;
+
+    // American contracts can be exercised, and therefore assigned, before
+    // expiration. European ones cannot: SPX and most cash-settled index series are
+    // European, so a dividend-driven early assignment on one is not conservative,
+    // it is impossible.
     bool is_american = true;
+    SettlementStyle settlement_style = SettlementStyle::PhysicalDelivery;
+
+    // Last instant a new position may be opened. Equal to expiration for a
+    // PM-settled contract. An AM-settled index series stops trading the business
+    // day BEFORE expiration and settles against the next morning's opening prints,
+    // so the two differ and a bar-based feed that ignores the distinction lets a
+    // strategy trade a contract that no longer exists.
+    Timestamp last_trade_at = Timestamp::never();
 
     // Listed strike, and the strike the pricing transform actually uses. They
     // differ for an adjusted contract whose deliverable is not 100 shares.
@@ -61,6 +81,14 @@ struct OptionContractVersion {
     bool covers(Timestamp t) const {
         return valid_from <= t && (valid_to.is_never() || t < valid_to);
     }
+
+    // Whether a NEW position may be opened at this instant. Closing an existing
+    // one is governed by covers() alone.
+    bool tradable_at(Timestamp t) const {
+        return last_trade_at.is_never() ? t < expiration : t <= last_trade_at;
+    }
+
+    bool is_cash_settled() const { return settlement_style == SettlementStyle::CashSettlement; }
 
     // Whether the terms were available to a participant at this moment.
     bool known_at(Timestamp t) const { return source_available_at <= t; }
