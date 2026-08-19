@@ -81,6 +81,10 @@ PYBIND11_MODULE(obt_engine, m) {
         .value("NEXT_BAR_OPEN", ExecutionTiming::NextBarOpen)
         .value("SAME_BAR_CLOSE", ExecutionTiming::SameBarClose);
 
+    py::enum_<EquityCurveResolution>(m, "EquityCurveResolution")
+        .value("PER_BAR", EquityCurveResolution::PerBar)
+        .value("PER_SESSION", EquityCurveResolution::PerSession);
+
     py::enum_<AssignmentPolicy>(m, "AssignmentPolicy")
         .value("EXPIRATION_ONLY", AssignmentPolicy::ExpirationOnly)
         .value("EXPLICIT_EXERCISE_ONLY", AssignmentPolicy::ExplicitExerciseOnly)
@@ -479,7 +483,9 @@ PYBIND11_MODULE(obt_engine, m) {
         .def_readwrite("reject_stale_bars", &BacktestConfig::reject_stale_bars)
         .def_readwrite("require_point_in_time_terms", &BacktestConfig::require_point_in_time_terms)
         .def_readwrite("mark_age_limit_ns", &BacktestConfig::mark_age_limit_ns)
-        .def_readwrite("require_monotonic_time", &BacktestConfig::require_monotonic_time);
+        .def_readwrite("require_monotonic_time", &BacktestConfig::require_monotonic_time)
+        .def_readwrite("equity_curve_resolution", &BacktestConfig::equity_curve_resolution)
+        .def_readwrite("max_retained_records", &BacktestConfig::max_retained_records);
 
     py::class_<PathMetrics>(m, "PathMetrics")
         .def_readonly("scenario_id", &PathMetrics::scenario_id)
@@ -518,6 +524,9 @@ PYBIND11_MODULE(obt_engine, m) {
                       &PathMetrics::settlements_without_official_price)
         .def_readonly("stale_mark_valuations", &PathMetrics::stale_mark_valuations)
         .def_readonly("max_mark_age_ns", &PathMetrics::max_mark_age_ns)
+        .def_readonly("dropped_fills", &PathMetrics::dropped_fills)
+        .def_readonly("dropped_rejections", &PathMetrics::dropped_rejections)
+        .def_readonly("dropped_trades", &PathMetrics::dropped_trades)
         .def_property_readonly("dividend_cash",
             [](const PathMetrics& m) { return m.dividend_cash.to_double(); })
         .def_property_readonly("dividend_cash_micros",
@@ -813,11 +822,6 @@ PYBIND11_MODULE(obt_engine, m) {
         .def("rejections", &Engine::rejections, py::return_value_policy::copy)
         .def("positions", [](const Engine& e) { return e.positions().snapshot(); })
         .def("equity_positions", [](const Engine& e) { return e.positions().equity_snapshot(); })
-        .def("equity_curve", [](const Engine& e) {
-            std::vector<double> out;
-            for (Money m : e.equity_curve()) out.push_back(m.to_double());
-            return out;
-        })
         .def("trades", &Engine::trades, py::return_value_policy::copy)
         .def("equity_points", &Engine::equity_points, py::return_value_policy::copy)
         .def("ledger_entries", [](const Engine& e) { return e.ledger().entries(); })

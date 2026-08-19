@@ -21,6 +21,9 @@ namespace obt {
 // How options that finish in the money are resolved. Exercise and assignment
 // are deterministic policies, never Monte Carlo: randomizing them would mix an
 // unobservable into results that are otherwise reproducible.
+// Whether the equity curve gets a point every bar or once per session.
+enum class EquityCurveResolution : uint8_t { PerBar, PerSession };
+
 enum class AssignmentPolicy : uint8_t {
     // Options simply expire; nothing is exercised. Useful for isolating
     // pure premium capture.
@@ -114,6 +117,23 @@ struct BacktestConfig {
     // instant let an order submitted on one fill on the other, which defeats
     // next-bar-open timing; a bar that goes backwards is time travel.
     bool require_monotonic_time = true;
+
+    // How often an equity point is recorded.
+    //
+    // Per bar was unbounded and enormous: a ticker-year is 98,280 bars, so 1,000
+    // Monte Carlo paths held 7.1 GB of equity points alone. Per session is 390x
+    // smaller and loses nothing that matters, because peak equity and max drawdown
+    // are running scalars updated on EVERY bar and stay exact at bar resolution
+    // regardless of what the curve records. The curve is for shape -- sparklines,
+    // Sharpe, time in drawdown -- and daily is the resolution those are
+    // conventionally computed at anyway.
+    EquityCurveResolution equity_curve_resolution = EquityCurveResolution::PerSession;
+
+    // Cap on retained fills, rejections and trades, per path. Zero means unbounded.
+    // Beyond the cap the records stop accumulating and the DROPPED COUNT is
+    // recorded, so a truncated history is visible rather than looking like a quiet
+    // run. Statistics computed from these are then explicitly partial.
+    int64_t max_retained_records = 1'000'000;
 };
 
 // Why a position stopped existing. Distinguishing these matters because a
@@ -201,6 +221,11 @@ struct PathMetrics {
     // oldest mark any valuation leaned on.
     int64_t stale_mark_valuations = 0;
     int64_t max_mark_age_ns = 0;
+    // Records dropped at the retention cap. Nonzero means the fill, rejection or
+    // trade LISTS are partial -- the counts and the ledger are not.
+    int64_t dropped_fills = 0;
+    int64_t dropped_rejections = 0;
+    int64_t dropped_trades = 0;
     // Net dividend cash: received on long shares, owed on short.
     Money dividend_cash{};
 };
@@ -298,7 +323,7 @@ public:
         metrics_ = PathMetrics{};
         metrics_.scenario_id = scenario_id;
         metrics_.peak_equity = cfg_.initial_cash;
-        equity_curve_.clear();
+
         next_order_id_ = 1;
         next_trade_id_ = 1;
         trades_.clear();
@@ -349,9 +374,11 @@ public:
     void submit_group(OrderGroup group) {
         if (halted_) {
             for (const Order& leg : group.legs) {
-                rejections_.push_back(OrderRejection{
-                    leg.order_id, group.group_id, now_, RejectReason::RiskLimitBreached,
-                    "trading halted by risk control"});
+                retain(rejections_, OrderRejection{
+                           leg.order_id, group.group_id, now_,
+                           RejectReason::RiskLimitBreached,
+                           "trading halted by risk control"},
+                       metrics_.dropped_rejections);
                 metrics_.rejection_count++;
             }
             return;
@@ -394,6 +421,8 @@ public:
     void end_session(Timestamp session_close) {
         process_expirations_through(session_close);
         capture_session_close();
+        if (cfg_.equity_curve_resolution == EquityCurveResolution::PerSession)
+            flush_equity_point();
         const AccountState state = account_state();
         enforce_risk(state);
         // Reset the daily loss baseline so max_daily_loss is genuinely daily
@@ -428,7 +457,6 @@ public:
     const PathMetrics& metrics() const { return metrics_; }
     const std::vector<Fill>& fills() const { return fills_; }
     const std::vector<OrderRejection>& rejections() const { return rejections_; }
-    const std::vector<Money>& equity_curve() const { return equity_curve_; }
     const std::vector<EquityPoint>& equity_points() const { return equity_points_; }
     const std::vector<TradeRecord>& trades() const { return trades_; }
     const Ledger& ledger() const { return ledger_; }
@@ -442,6 +470,7 @@ public:
         metrics_.unrealized_pnl = s.unrealized_pnl;
         metrics_.fees = s.fees_paid;
         metrics_.net_pnl = s.equity - cfg_.initial_cash;
+        flush_equity_point();
         metrics_.ledger_reconciles = ledger_.reconciles();
         if (!cfg_.initial_cash.is_zero()) {
             metrics_.return_fraction =
@@ -610,8 +639,8 @@ private:
             CloseReason::Adjusted, multiplier,
         });
 
-        rejections_.push_back(OrderRejection{
-            0, 0, now_, RejectReason::UnconfirmedLineage, why});
+        retain(rejections_, OrderRejection{0, 0, now_, RejectReason::UnconfirmedLineage, why},
+               metrics_.dropped_rejections);
         metrics_.rejection_count++;
         metrics_.truncated = true;
         metrics_.quarantined_positions++;
@@ -776,7 +805,7 @@ private:
         f.gross_cash = p.gross_cash;
         f.fees = p.fees;
         f.net_cash = p.gross_cash - p.fees;
-        fills_.push_back(f);
+        retain(fills_, f, metrics_.dropped_fills);
 
         metrics_.fill_count++;
         metrics_.spread_cost += f.spread_cost();
@@ -865,7 +894,7 @@ private:
         f.side = OrderSide::Sell;
         f.quantity = count;
         f.multiplier = p.multiplier;
-        fills_.push_back(f);
+        retain(fills_, f, metrics_.dropped_fills);
         metrics_.fill_count++;
     }
 
@@ -1079,7 +1108,7 @@ private:
             f.gross_cash = p.gross_cash;
             f.fees = p.fees;
             f.net_cash = p.gross_cash - p.fees;
-            fills_.push_back(f);
+            retain(fills_, f, metrics_.dropped_fills);
 
             metrics_.fill_count++;
             metrics_.spread_cost += f.spread_cost();
@@ -1089,7 +1118,8 @@ private:
 
     void reject_group(const OrderGroup& group, RejectReason reason, const std::string& detail) {
         for (const Order& o : group.legs) {
-            rejections_.push_back(OrderRejection{o.order_id, group.group_id, now_, reason, detail});
+            retain(rejections_, OrderRejection{o.order_id, group.group_id, now_, reason, detail},
+                   metrics_.dropped_rejections);
             metrics_.rejection_count++;
         }
     }
@@ -1549,15 +1579,39 @@ private:
         metrics_.trade_count++;
         if (t.realized_pnl > Money::zero()) metrics_.winning_trades++;
         else if (t.realized_pnl < Money::zero()) metrics_.losing_trades++;
-        trades_.push_back(std::move(t));
+        retain(trades_, std::move(t), metrics_.dropped_trades);
+    }
+
+    // `pending_point` carries the latest bar's state so a per-session curve records
+    // the session's CLOSING state rather than whichever bar happened to be last
+    // written.
+    void flush_equity_point() {
+        if (!has_pending_point_) return;
+        equity_points_.push_back(pending_point_);
+        has_pending_point_ = false;
+    }
+
+    // Appends to a per-path record vector unless the retention cap is reached, in
+    // which case the drop is counted. A silently truncated history reads as a quiet
+    // run; a counted one reads as a truncated history.
+    template <typename Vec, typename T>
+    void retain(Vec& vec, T&& value, int64_t& dropped) {
+        if (cfg_.max_retained_records > 0
+            && static_cast<int64_t>(vec.size()) >= cfg_.max_retained_records) {
+            dropped++;
+            return;
+        }
+        vec.push_back(std::forward<T>(value));
     }
 
     void record_equity(const AccountState& s) {
-        equity_curve_.push_back(s.equity);
-        equity_points_.push_back(EquityPoint{
+        pending_point_ = EquityPoint{
             now_, s.cash, s.realized_pnl, s.unrealized_pnl, s.equity,
             s.margin_requirement, position_market_value(), s.open_position_count,
-        });
+        };
+        has_pending_point_ = true;
+        if (cfg_.equity_curve_resolution == EquityCurveResolution::PerBar)
+            flush_equity_point();
         for (const MarketBar& b : current_.bars)
             last_mark_[b.contract_version_id.value] = StampedMark{
                 b.valuation_price.is_zero() ? b.close : b.valuation_price, now_};
@@ -1594,8 +1648,9 @@ private:
     uint64_t bars_seen_ = 0;
     std::unordered_map<std::string, StampedMark> last_underlying_;
 
-    std::vector<Money> equity_curve_;
     std::vector<EquityPoint> equity_points_;
+    EquityPoint pending_point_{};
+    bool has_pending_point_ = false;
     std::vector<TradeRecord> trades_;
     mutable PathMetrics metrics_;
     Timestamp now_{};

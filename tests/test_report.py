@@ -163,9 +163,13 @@ class TestTradeLedger:
     """One record per closing event, with exact realized P&L."""
 
     @staticmethod
-    def _round_trip(entry: float, exit_price: float, contracts: int = 1):
+    def _round_trip(entry: float, exit_price: float, contracts: int = 1,
+                    resolution=None):
         c = make_contract(CALL, strike=100.0, expiry_day=400)
-        h = EngineHarness(base_config(cash=100_000.0), [c])
+        cfg = base_config(cash=100_000.0)
+        if resolution is not None:
+            cfg.equity_curve_resolution = resolution
+        h = EngineHarness(cfg, [c])
         h.bar(day_ns(1), [make_bar(CALL, timestamp_ns=day_ns(1), price=entry)],
               groups=[group(buy(CALL, contracts))])
         h.bar(day_ns(2), [make_bar(CALL, timestamp_ns=day_ns(2), price=entry)],
@@ -227,7 +231,7 @@ class TestTradeLedger:
         assert m.best_trade_pnl == pytest.approx(150.0)
 
     def test_equity_points_decompose_realized_and_unrealized(self):
-        h = self._round_trip(2.00, 3.50)
+        h = self._round_trip(2.00, 3.50, resolution=E.EquityCurveResolution.PER_BAR)
         points = h.engine.equity_points()
         assert len(points) == 3
         for p in points:

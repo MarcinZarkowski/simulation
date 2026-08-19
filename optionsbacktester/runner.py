@@ -103,7 +103,6 @@ class RunManifest:
 class RunResult:
     manifest: RunManifest
     paths: list[E.PathMetrics]
-    equity_curves: list[list[float]]
     fills: list[E.Fill]
     rejections: list[E.OrderRejection]
     # Per-path trade ledgers and decomposed equity series. Both are needed for
@@ -342,7 +341,6 @@ def run(
     return RunResult(
         manifest=manifest,
         paths=results,
-        equity_curves=[e.equity_curve() for e in engines],
         fills=list(engines[0].fills()),
         rejections=list(engines[0].rejections()),
         trades=[list(e.trades()) for e in engines],

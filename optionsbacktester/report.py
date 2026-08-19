@@ -377,6 +377,9 @@ def build_performance_report(result: RunResult, confidence_level: float = 0.95,
         account=account_stats(
             result.equity_points[index] if result.equity_points else [],
             result.manifest.initial_cash,
+            # Bar-resolution figures the engine tracked exactly, which the curve may
+            # be too coarse to reproduce.
+            result.paths[index] if index < len(result.paths) else None,
         ),
         trades=trade_stats(result.trades[index] if result.trades else []),
         path_index=index,

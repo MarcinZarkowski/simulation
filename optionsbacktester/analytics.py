@@ -297,8 +297,19 @@ def sparkline(values: list[float], width: int = 60) -> str:
                    for v in sampled)
 
 
-def account_stats(points: list[E.EquityPoint], initial_cash: float) -> AccountStats:
-    """Summarize one path's account evolution."""
+def account_stats(points: list[E.EquityPoint], initial_cash: float,
+                  exact: E.PathMetrics | None = None) -> AccountStats:
+    """
+    Summarize one path's account evolution.
+
+    ``exact`` supplies figures the engine tracks as running scalars updated on every
+    bar. Where it is given, those override the curve-derived versions, because the
+    curve may be recorded once per session while the scalars are not: on a 30-day
+    run the curve understated max drawdown by 1.2% purely because the trough fell
+    between two recorded points. Passing it is how the report reports the drawdown
+    the account actually experienced rather than the one the sampling happened to
+    catch.
+    """
     a = AccountStats()
     if not points:
         return a
@@ -333,6 +344,14 @@ def account_stats(points: list[E.EquityPoint], initial_cash: float) -> AccountSt
             if running_peak > 0:
                 a.max_drawdown_fraction = max(a.max_drawdown_fraction, drop / running_peak)
     a.time_in_drawdown_fraction = under_water / len(a.total_curve)
+
+    if exact is not None:
+        a.peak_equity = max(a.peak_equity, exact.peak_equity)
+        a.max_drawdown = max(a.max_drawdown, exact.max_drawdown)
+        a.peak_margin = max(a.peak_margin, exact.peak_margin_requirement)
+        if a.peak_equity > 0:
+            a.max_drawdown_fraction = max(a.max_drawdown_fraction,
+                                          a.max_drawdown / a.peak_equity)
 
     if initial_cash:
         a.total_return_fraction = (a.ending_equity - initial_cash) / initial_cash
