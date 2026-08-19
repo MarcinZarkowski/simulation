@@ -187,14 +187,55 @@ class DataLake:
             return {}
 
 
+# Available-column sets, keyed by (lake directory, file name).
+#
+# Reading a file's schema means reading its Parquet metadata, which cost ~0.8 ms and
+# happened twice per trading day -- 15% of a run's wall clock on a 40-day lake, spent
+# re-establishing that every day's options file has the same columns as the last.
+#
+# Cached per (lake, file name) rather than per path, so a 252-day run pays it twice
+# instead of 504 times. A schema that genuinely changes mid-history is handled by the
+# fallback below rather than by giving up the cache: a select against a stale set
+# raises, and the entry is then re-derived for that file. So the cache is a
+# performance assumption, not a correctness one.
+_SCHEMA_CACHE: dict[tuple[str, str], frozenset[str]] = {}
+
+
+def _available_columns(path: Path, *, refresh: bool = False) -> frozenset[str]:
+    key = (str(path.parent.parent.parent.parent), path.name)
+    if refresh or key not in _SCHEMA_CACHE:
+        _SCHEMA_CACHE[key] = frozenset(pl.scan_parquet(path).collect_schema().names())
+    return _SCHEMA_CACHE[key]
+
+
+def _collect_projected(path: Path, columns: list[str], transform=None) -> pl.DataFrame:
+    """
+    Project `path` to `columns`, apply `transform`, and collect.
+
+    The retry wraps the COLLECT, not the select. Polars is lazy, so a projection
+    naming a column the file does not have raises at collection time -- a try around
+    the select would never fire, and the cache would be a correctness assumption
+    after all.
+    """
+    for refresh in (False, True):
+        available = _available_columns(path, refresh=refresh)
+        lazy = pl.scan_parquet(path).select([c for c in columns if c in available])
+        if transform is not None:
+            lazy = transform(lazy)
+        try:
+            return lazy.collect()
+        except pl.exceptions.ColumnNotFoundError:
+            if refresh:
+                raise
+    raise AssertionError("unreachable")
+
+
 def _read_optional(path: Path, columns: list[str] | None = None) -> pl.DataFrame:
     if not path.exists():
         return pl.DataFrame()
-    scan = pl.scan_parquet(path)
-    if columns:
-        available = set(scan.collect_schema().names())
-        scan = scan.select([c for c in columns if c in available])
-    return scan.collect()
+    if not columns:
+        return pl.scan_parquet(path).collect()
+    return _collect_projected(path, columns)
 
 
 def load_day(
@@ -214,30 +255,28 @@ def load_day(
     if not options_path.exists():
         return DaySlice(DataLake.day_of(day_dir), ticker, pl.DataFrame(), pl.DataFrame())
 
-    scan = pl.scan_parquet(options_path)
-    available = set(scan.collect_schema().names())
-    scan = scan.select([c for c in OPTION_COLUMNS if c in available])
-
-    for predicate in universe.predicates():
-        scan = scan.filter(predicate)
-
-    options = scan.with_columns(
-        ((pl.col("expiration") - pl.col("timestamp")).dt.total_seconds() / 86400.0).alias("dte"),
-        pl.when(pl.col("underlying_price") > 0)
-        .then((pl.col("strike") / pl.col("underlying_price")).log())
-        .otherwise(None)
-        .alias("moneyness"),
-        # The pipeline scales Greeks per 100-share contract; selection is per share.
-        (pl.col("delta") / pl.col("deliverable_equity_amount").fill_null(100.0))
-        .alias("delta_per_share"),
-    )
-    for predicate in universe.derived_predicates():
-        options = options.filter(predicate)
+    def shape(scan: pl.LazyFrame) -> pl.LazyFrame:
+        for predicate in universe.predicates():
+            scan = scan.filter(predicate)
+        options = scan.with_columns(
+            ((pl.col("expiration") - pl.col("timestamp")).dt.total_seconds() / 86400.0)
+            .alias("dte"),
+            pl.when(pl.col("underlying_price") > 0)
+            .then((pl.col("strike") / pl.col("underlying_price")).log())
+            .otherwise(None)
+            .alias("moneyness"),
+            # The pipeline scales Greeks per 100-share contract; selection is per share.
+            (pl.col("delta") / pl.col("deliverable_equity_amount").fill_null(100.0))
+            .alias("delta_per_share"),
+        )
+        for predicate in universe.derived_predicates():
+            options = options.filter(predicate)
+        return options.sort(["timestamp", "symbol"])
 
     return DaySlice(
         day=DataLake.day_of(day_dir),
         ticker=ticker,
-        options=options.sort(["timestamp", "symbol"]).collect(),
+        options=_collect_projected(options_path, OPTION_COLUMNS, shape),
         stock=_read_optional(day_dir / "stock.parquet", STOCK_COLUMNS),
         corporate_actions=_read_optional(day_dir / "corporate_actions.parquet"),
         contract_versions=_read_optional(day_dir / "option_contract_version.parquet"),

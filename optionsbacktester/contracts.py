@@ -264,6 +264,97 @@ def build_equity_bars(stock: pl.DataFrame, underlying_symbol: str) -> list[E.Equ
     return out
 
 
+def build_bar_view(
+    timestamp: datetime,
+    batch: pl.DataFrame,
+    contracts: dict[int, E.OptionContractVersion],
+    underlying_symbol: str,
+    stock: pl.DataFrame | None = None,
+):
+    """
+    Snapshot and chain from ONE pass over the batch.
+
+    ``build_bars``, ``build_analytics`` and ``chain_from_batch`` each iterated the
+    same frame independently, so every bar was materialized into Python dicts three
+    times and the version key recomputed three times per row. They remain available
+    separately because tests and callers use them individually; this is the path the
+    runner takes.
+    """
+    from .strategy import Chain, chain_row_from
+
+    snap = E.MarketSnapshot()
+    snap.timestamp = to_ns(timestamp)
+    if stock is not None:
+        snap.equity_bars = build_equity_bars(stock, underlying_symbol)
+
+    bars: list[E.MarketBar] = []
+    analytics: list[E.OptionAnalytics] = []
+    chain_rows = []
+    underlying: float | None = None
+
+    for row in batch.iter_rows(named=True):
+        key = contract_version_key(
+            row["symbol"], _float(row, "strike", 0.0),
+            _float(row, "deliverable_equity_amount", 100.0),
+            _float(row, "quote_multiplier", 100.0),
+        )
+        contract = contracts.get(key)
+        if contract is None:
+            continue
+
+        price = row.get("underlying_price")
+        if price is not None:
+            underlying = float(price)
+
+        timestamp_ns = to_ns(row["timestamp"])
+        # One validity decision, used by both the bar and the analytics row.
+        analytics_valid = not (
+            bool(row.get("iv_failed", False)) or bool(row.get("iv_is_model_fallback", False))
+        )
+
+        bars.append(_market_bar(row, key, timestamp_ns, analytics_valid))
+        analytics.append(_option_analytics(row, key, timestamp_ns, analytics_valid))
+        if contract.analytics_supported:
+            chain_rows.append(chain_row_from(row, key))
+
+    snap.bars = bars
+    snap.analytics = analytics
+    snap.underlying_price = {underlying_symbol: underlying} if underlying is not None else {}
+    return snap, Chain(chain_rows, underlying)
+
+
+def _market_bar(row: dict, key: int, timestamp_ns: int, analytics_valid: bool) -> E.MarketBar:
+    b = E.MarketBar()
+    b.timestamp = timestamp_ns
+    b.contract_version_id = key
+    b.open = _float(row, "open", 0.0)
+    b.high = _float(row, "high", 0.0)
+    b.low = _float(row, "low", 0.0)
+    b.close = _float(row, "close", 0.0)
+    b.vwap = _float(row, "vwap", 0.0)
+    b.valuation_price = _float(row, "valuation_price", b.close)
+    b.volume = int(row.get("volume") or 0)
+    b.trade_count = int(row.get("trade_count") or 0)
+    b.stale = bool(row.get("is_stale", False))
+    b.analytics_valid = analytics_valid
+    return b
+
+
+def _option_analytics(row: dict, key: int, timestamp_ns: int,
+                      analytics_valid: bool) -> E.OptionAnalytics:
+    a = E.OptionAnalytics()
+    a.timestamp = timestamp_ns
+    a.contract_version_id = key
+    a.implied_volatility = _float(row, "smoothed_iv", 0.0)
+    a.delta = _float(row, "delta", 0.0)
+    a.gamma = _float(row, "gamma", 0.0)
+    a.theta = _float(row, "theta", 0.0)
+    a.vega = _float(row, "vega", 0.0)
+    a.rho = _float(row, "rho", 0.0)
+    a.valid = analytics_valid
+    return a
+
+
 def build_snapshot(
     timestamp: datetime,
     batch: pl.DataFrame,

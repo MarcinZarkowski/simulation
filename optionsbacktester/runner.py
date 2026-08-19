@@ -26,15 +26,15 @@ import polars as pl
 import obt_engine as E
 
 from .contracts import (
+    build_bar_view,
     build_contracts,
     build_dividends,
     build_lineage_transitions,
-    build_snapshot,
     contract_version_key,
     to_ns,
 )
 from .stream import DataLake, DaySlice, UniverseFilter, iter_days, iter_timestamp_batches
-from .strategy import Chain, Context, Strategy, chain_from_batch
+from .strategy import Context, Strategy
 
 
 def _row_key(row: dict) -> int:
@@ -394,9 +394,12 @@ def _run_day(
     for ts, batch in iter_timestamp_batches(day):
         bar_count += 1
         option_row_count += batch.height
-        snapshot = build_snapshot(ts, batch, contracts, ticker,
-                                  stock_by_time.get((ts,)))
-        chain = chain_from_batch(batch, contracts, _row_key)
+        # One pass over the batch for the snapshot and the chain together. They used
+        # to be three independent passes -- bars, analytics, chain -- so every bar was
+        # materialized into Python dicts three times and the version key recomputed
+        # three times per row.
+        snapshot, chain = build_bar_view(ts, batch, contracts, ticker,
+                                        stock_by_time.get((ts,)))
 
         for i, (engine, strategy) in enumerate(zip(engines, strategies, strict=True)):
             engine.begin_bar(snapshot)

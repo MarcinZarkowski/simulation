@@ -296,6 +296,39 @@ class Strategy:
         pass
 
 
+def chain_row_from(row: dict, key: int) -> ChainRow:
+    """
+    One chain row from one option row.
+
+    Shared with the single-pass bar builder so the chain a strategy reads and the
+    bars the engine prices come from the same row, derived the same way.
+    """
+    price = row.get("underlying_price")
+    mark = row.get("valuation_price") or row.get("close") or 0.0
+    # Divide by the real deliverable so per-share Greeks stay correct even when a
+    # contract does not deliver 100 shares.
+    shares = float(row.get("deliverable_equity_amount") or 100.0) or 100.0
+    contract_delta = float(row.get("delta") or 0.0)
+    return ChainRow(
+        symbol=row["symbol"],
+        contract_version_id=key,
+        flag=row["flag"],
+        strike=float(row["strike"]),
+        expiration=row["expiration"],
+        dte=float(row.get("dte") or 0.0),
+        mark=float(mark),
+        underlying_price=float(price) if price is not None else 0.0,
+        delta=contract_delta / shares,
+        gamma=float(row.get("gamma") or 0.0) / shares,
+        theta=float(row.get("theta") or 0.0) / shares,
+        vega=float(row.get("vega") or 0.0) / shares,
+        implied_volatility=float(row.get("smoothed_iv") or 0.0),
+        volume=int(row.get("volume") or 0),
+        contract_delta=contract_delta,
+        moneyness=float(row.get("moneyness") or 0.0),
+    )
+
+
 def chain_from_batch(
     batch: pl.DataFrame,
     contracts: dict[int, E.OptionContractVersion],
@@ -304,8 +337,8 @@ def chain_from_batch(
     """
     Build a Chain from one timestamp batch.
 
-    Only contracts the pipeline priced are included, so a strategy cannot select
-    a contract whose Greeks are absent and then act on a zero delta.
+    Only contracts the pipeline priced are included, so a strategy cannot select a
+    contract whose Greeks are absent and then act on a zero delta.
     """
     rows: list[ChainRow] = []
     underlying: float | None = None
@@ -317,27 +350,5 @@ def chain_from_batch(
         price = row.get("underlying_price")
         if price is not None:
             underlying = float(price)
-        mark = row.get("valuation_price") or row.get("close") or 0.0
-        # Divide by the real deliverable so per-share Greeks stay correct even
-        # when a contract does not deliver 100 shares.
-        shares = float(row.get("deliverable_equity_amount") or 100.0) or 100.0
-        contract_delta = float(row.get("delta") or 0.0)
-        rows.append(ChainRow(
-            symbol=row["symbol"],
-            contract_version_id=key,
-            flag=row["flag"],
-            strike=float(row["strike"]),
-            expiration=row["expiration"],
-            dte=float(row.get("dte") or 0.0),
-            mark=float(mark),
-            underlying_price=float(price) if price is not None else 0.0,
-            delta=contract_delta / shares,
-            gamma=float(row.get("gamma") or 0.0) / shares,
-            theta=float(row.get("theta") or 0.0) / shares,
-            vega=float(row.get("vega") or 0.0) / shares,
-            implied_volatility=float(row.get("smoothed_iv") or 0.0),
-            volume=int(row.get("volume") or 0),
-            contract_delta=contract_delta,
-            moneyness=float(row.get("moneyness") or 0.0),
-        ))
+        rows.append(chain_row_from(row, key))
     return Chain(rows, underlying)
