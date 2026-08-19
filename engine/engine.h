@@ -1142,9 +1142,24 @@ private:
         // collateralize their own purchase: cash has to cover the debit in
         // full. Only stock lends, and only in a margin account. Counting option
         // market value here would let an empty account buy an unlimited premium.
+        // Admission compares what the account will have against what the book will
+        // require. Share positions are credited at FULL market value and the margin
+        // model charges them in `res.requirement`, so the two offset to exactly the
+        // model's own fraction: net zero under Reg-T's 50%, and net zero under a cash
+        // account's 100%.
+        //
+        // Crediting a LOAN fraction here instead double-charged. A cash account lends
+        // nothing but is still charged 100%, so it needed twice the purchase price to
+        // buy stock: measured at $12,000 of cash unable to buy $10,000 of shares it
+        // had already paid for in full. A mutation survivor on the loan fraction is
+        // what led here -- the function it lived in has no callers now.
+        //
+        // Long OPTION value is deliberately still excluded. The margin model charges
+        // nothing for a long option, so crediting its value would let the option
+        // collateralize its own purchase.
         Money available = ledger_.cash();
         for (const auto& p : plan) available += p.gross_cash - p.fees;
-        available += scale(probe_equity_value(probe), equity_loan_fraction());
+        available += probe_equity_value(probe);
 
         if (available - res.requirement < Money::zero()) {
             *reason = RejectReason::InsufficientBuyingPower;
@@ -1243,12 +1258,6 @@ private:
     // -----------------------------------------------------------------------
     // Valuation
     // -----------------------------------------------------------------------
-    // Reg-T initial requirement for stock is 50%, so half the position lends.
-    // A cash account lends nothing.
-    double equity_loan_fraction() const {
-        return cfg_.margin_model == MarginModelKind::CashAccount ? 0.0 : 0.5;
-    }
-
     Money probe_equity_value(const PositionBook& book) const {
         Money total = Money::zero();
         for (const EquityPosition& e : book.equity_snapshot())
