@@ -187,6 +187,17 @@ inline std::vector<SpreadPairing> pair_legs(
             for (LegView& l : longs) {
                 if (l.contracts <= 0) continue;
                 if (l.contract->expiration < s.contract->expiration) continue;
+                // Spread treatment requires the aggregate underlying value of the
+                // long and short sides to be equal (FINRA 4210(f)(2)(A)(xxxii)(d)).
+                // Pairing one contract against one contract only achieves that when
+                // both deliver the same number of shares. A 100-share long against a
+                // 400-share short leaves 300 shares of naked exposure whose loss is
+                // unbounded, and because the payoff slopes then fail to cancel, the
+                // max-loss netting below would not even see it: evaluating at the two
+                // strikes returns a net gain. Refuse the pairing so the short falls
+                // through to the naked charge.
+                if (l.contract->deliverable_shares_per_contract()
+                    != s.contract->deliverable_shares_per_contract()) continue;
                 const Money residual = (type == OptionType::Call)
                     ? max_money(l.contract->strike - s.contract->strike, Money::zero())
                     : max_money(s.contract->strike - l.contract->strike, Money::zero());

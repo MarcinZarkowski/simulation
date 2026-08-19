@@ -753,3 +753,54 @@ class TestEdgeInputs:
 
         assert result.requirement_micros == micros((95.0 + 50.0) * SHARES_PER_CONTRACT)
         assert len(result.pairings) == 2
+
+
+class TestMixedDeliverablePairing:
+    """
+    Spread treatment requires the long and short sides to carry equal aggregate
+    underlying value, not merely equal contract counts. A split leaves contracts
+    with different deliverables on one underlying, which is exactly where a
+    count-based pairing goes wrong.
+    """
+
+    LONG = 1
+    SHORT = 2
+
+    def _legs(self, long_shares, short_shares):
+        return [
+            make_contract(self.LONG, strike=100.0, expiry_day=400,
+                          deliverable_shares=long_shares),
+            make_contract(self.SHORT, strike=110.0, expiry_day=30,
+                          deliverable_shares=short_shares),
+        ]
+
+    HOLDINGS = [(LONG, 1), (SHORT, -1)]
+
+    def test_matched_deliverables_pair_to_zero(self):
+        result = margin(E.MarginModel.REG_T, self._legs(100, 100), self.HOLDINGS,
+                        marks={self.SHORT: 5.0})
+        assert result.requirement_micros == 0
+        assert not only(result.pairings).naked
+
+    def test_short_delivering_more_shares_is_not_covered(self):
+        """
+        A 100-share long against a 400-share short leaves 300 shares of naked
+        exposure whose loss is unbounded. Because the payoff slopes then fail to
+        cancel, max-loss netting evaluated at the strikes reports a net gain and
+        would charge nothing at all.
+        """
+        result = margin(E.MarginModel.REG_T, self._legs(100, 400), self.HOLDINGS,
+                        marks={self.SHORT: 5.0})
+        assert result.requirement_micros > 0
+        assert only(result.pairings).naked
+
+    def test_short_delivering_fewer_shares_is_also_not_covered(self):
+        result = margin(E.MarginModel.REG_T, self._legs(400, 100), self.HOLDINGS,
+                        marks={self.SHORT: 5.0})
+        assert result.requirement_micros > 0
+        assert only(result.pairings).naked
+
+    def test_robinhood_refuses_a_mismatched_short_call(self):
+        result = margin(E.MarginModel.ROBINHOOD, self._legs(100, 400), self.HOLDINGS,
+                        marks={self.SHORT: 5.0})
+        assert result.disallowed
