@@ -121,25 +121,36 @@ class ReferenceEngine:
 
     def _settle_expirations(self, now_ns: int) -> None:
         """
-        Physical delivery at expiry, exercised from one cent of intrinsic.
+        Physical delivery at expiry, exercised from one cent of intrinsic per share.
 
-        A long call and a short put receive shares against paying and receiving
-        the strike respectively; a long put and a short call deliver them.
+        A long call and a short put receive shares against paying and receiving the
+        aggregate exercise price respectively; a long put and a short call deliver
+        them.
+
+        The aggregate exercise price is the LISTED strike times the QUOTE
+        multiplier, per the pipeline's documented payoff
+        max(A * S_T + C - K * M, 0). Derived from that formula rather than from the
+        engine's code, so this stays an independent check: an earlier version used
+        strike x delivered-shares, which reproduced the engine's own defect and
+        therefore could not have caught it.
         """
         for cv in list(self.positions):
             terms = self.terms[cv]
             if day_ns(terms.expiry_day) > now_ns:
                 continue
             held, _ = self.positions.pop(cv)
-            strike = micros(terms.strike)
-            intrinsic = self.spot - strike if terms.is_call else strike - self.spot
-            if intrinsic < EXERCISE_THRESHOLD_MICROS:
+
+            aggregate = micros(terms.strike) * terms.multiplier
+            delivered = self.spot * terms.shares
+            payoff = (delivered - aggregate) if terms.is_call else (aggregate - delivered)
+            # One cent per share, so $1.00 on a standard 100-share contract.
+            if payoff < EXERCISE_THRESHOLD_MICROS * terms.shares:
                 continue
 
-            shares = terms.shares * abs(held)
+            count = abs(held)
             receives = (held > 0) == terms.is_call
-            self.shares += shares if receives else -shares
-            self.cash += -strike * shares if receives else strike * shares
+            self.shares += terms.shares * count if receives else -terms.shares * count
+            self.cash += -aggregate * count if receives else aggregate * count
 
     def quantities(self) -> dict[int, int]:
         return {cv: quantity for cv, (quantity, _) in self.positions.items()}
@@ -218,9 +229,16 @@ class TestSingleLegToExpiry:
         assert reference.shares == 100
         assert harness.finalize().final_equity_micros == micros(89_500.0 + 112.0 * 100)
 
-    def test_settlement_uses_the_deliverable_while_premium_uses_the_multiplier(self):
-        """Post 4:1 split terms: quoted per 100 shares, delivering 400 at strike 25."""
-        terms = [Terms(1, 25.0, is_call=True, expiry_day=5, multiplier=100, shares=400)]
+    def test_settlement_follows_the_deliverable_and_the_aggregate_strike(self):
+        """
+        Post 4:1 split terms: strike 25 delivering 400 shares.
+
+        The quote multiplier moves with the deliverable, which is what conserves
+        the aggregate exercise price: 25 x 400 equals the original 100 x 100. A
+        400-share deliverable left at a multiplier of 100 would make the aggregate
+        $2,500 against $12,000 of stock, which is not a contract OCC would issue.
+        """
+        terms = [Terms(1, 25.0, is_call=True, expiry_day=5, multiplier=400, shares=400)]
         steps = [
             Step(1, 26.0, {1: 3.00}, groups=(((1, 1),),)),
             Step(2, 26.0, {1: 4.00}),
@@ -232,9 +250,9 @@ class TestSingleLegToExpiry:
 
         harness, reference = assert_engines_agree(terms, steps)
 
-        assert reference.cash == micros(INITIAL_CASH - 400.0 - 25.0 * 400)
+        # Premium is quoted per multiplier: 4.00 x 400. Settlement pays 25 x 400.
+        assert reference.cash == micros(INITIAL_CASH - 4.00 * 400 - 25.0 * 400)
         assert reference.shares == 400
-        assert harness.finalize().final_equity_micros == micros(89_600.0 + 31.0 * 400)
 
     @pytest.mark.parametrize("spot,exercised", [
         pytest.param(100.01, True, id="one_cent_itm"),

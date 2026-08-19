@@ -644,5 +644,8 @@ PYBIND11_MODULE(obt_engine, m) {
         py::arg("order_id"), py::arg("instrument"), py::arg("timestamp_ns"), py::arg("leg") = 0);
 
     m.attr("AUTOMATIC_EXERCISE_THRESHOLD") = automatic_exercise_threshold().to_double();
+    m.def("aggregate_exercise_threshold",
+          [](int64_t shares) { return aggregate_exercise_threshold(shares).to_double(); },
+          py::arg("shares_per_contract"));
     m.def("assignment_policy_name", &assignment_policy_name, py::arg("policy"));
 }

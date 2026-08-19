@@ -49,6 +49,41 @@ struct OptionContractVersion {
         return deliverable_equity_microshares / 1'000'000;
     }
 
+    // True when the deliverable is not a whole number of shares. OCC settles the
+    // fraction in cash-in-lieu, which this engine has no primitive for, so such a
+    // contract is refused at settlement rather than silently truncated.
+    bool has_fractional_deliverable() const {
+        return deliverable_equity_microshares % 1'000'000 != 0;
+    }
+
+    // What the holder pays on exercise of a call, or receives on exercise of a
+    // put: the LISTED strike times the QUOTE multiplier.
+    //
+    // Not strike times the delivered share count. For an adjusted contract those
+    // differ, and the pipeline documents the payoff as
+    //   max(A * S_T + C - K * M, 0)
+    // with A delivered shares, C fixed cash, K the listed strike and M the quote
+    // multiplier. Using K * A instead fabricated value: a 50-share deliverable at
+    // K=100 with spot 110 paid $5,000 for $5,500 of stock on a contract whose true
+    // payoff was zero.
+    Money aggregate_exercise_price() const {
+        return Money{strike.micros * quote_multiplier};
+    }
+
+    // Total value delivered per contract at a given underlying price.
+    Money delivered_value(Money underlying) const {
+        return Money{underlying.micros * deliverable_shares_per_contract()} + deliverable_cash;
+    }
+
+    // Intrinsic value per contract, following the deliverable rather than
+    // assuming a 100-share standard contract.
+    Money payoff_at(Money underlying) const {
+        const Money delivered = delivered_value(underlying);
+        const Money aggregate = aggregate_exercise_price();
+        return type == OptionType::Call ? max_money(delivered - aggregate, Money::zero())
+                                        : max_money(aggregate - delivered, Money::zero());
+    }
+
     // Notional the contract controls at a given underlying price.
     Money notional(Money underlying) const {
         return Money{underlying.micros * deliverable_shares_per_contract()};

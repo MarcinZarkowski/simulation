@@ -198,8 +198,15 @@ class TestAssignmentPolicies:
 
 class TestAdjustedDeliverable:
     def test_exercise_uses_the_deliverable_rather_than_a_hundred_shares(self):
-        """Post 4:1 split terms: strike 25 against a 400-share deliverable."""
-        contract = make_contract(1, strike=25.0, deliverable_shares=400)
+        """
+        Post 4:1 split terms: strike 25 against a 400-share deliverable.
+
+        The quote multiplier moves with the deliverable, which is what conserves
+        the aggregate exercise price: 25 x 400 equals the original 100 x 100. A
+        400-share deliverable left at a multiplier of 100 would make the aggregate
+        $2,500 for $12,000 of stock, which is not a contract OCC would issue.
+        """
+        contract = make_contract(1, strike=25.0, deliverable_shares=400, multiplier=400)
         h = open_position([contract], buy(1, 1))
         cash_before = h.cash_micros
 
@@ -499,3 +506,110 @@ class TestCorporateActionFailClosed:
         assert h.quantity_of(self.PARENT) == 0
         assert any(r.reason == E.RejectReason.CONTRACT_NOT_TRADABLE
                    for r in h.rejections())
+
+
+class TestSettlementRequiresAnObservedSpot:
+    """
+    Settlement without a price is refused rather than guessed.
+
+    Falling back to zero made a put maximally in the money and settled it at a
+    fabricated price: measured at +$9,500 of invented profit and a 100-share
+    short position, with no rejection. A call silently expired worthless.
+    """
+
+    CV = 1
+
+    def _held_with_no_spot(self, is_call: bool):
+        # The contract's underlying is never priced in any snapshot.
+        c = make_contract(self.CV, strike=100.0, expiry_day=5, is_call=is_call,
+                          underlying="UNPRICED")
+        h = EngineHarness(base_config(cash=500_000.0), [c])
+        for day in (1, 2):
+            h.bar(day_ns(day),
+                  [make_bar(self.CV, timestamp_ns=day_ns(day), price=5.00)],
+                  underlying={"TEST": 100.0},
+                  groups=[group(buy(self.CV, 1))] if day == 1 else None)
+        h.engine.end_session(day_ns(6))
+        return h
+
+    @pytest.mark.parametrize("is_call", [True, False])
+    def test_the_position_is_quarantined_not_settled(self, is_call):
+        h = self._held_with_no_spot(is_call)
+        assert h.positions() == []
+        assert h.shares_of("UNPRICED") == 0
+        assert h.finalize().exercise_count == 0
+
+    @pytest.mark.parametrize("is_call", [True, False])
+    def test_it_is_flagged_rather_than_silent(self, is_call):
+        h = self._held_with_no_spot(is_call)
+        metrics = h.finalize()
+        assert metrics.truncated
+        assert len(h.rejections()) == 1
+        assert "underlying" in h.rejections()[0].detail
+
+    def test_no_value_is_fabricated(self):
+        """A put with no spot previously produced +$9,500 out of nothing."""
+        h = self._held_with_no_spot(is_call=False)
+        assert h.finalize().net_pnl <= 0.0
+        assert h.engine.ledger_reconciles()
+
+
+class TestAdjustedAggregateExercisePrice:
+    """
+    The aggregate exercise price is the listed strike times the QUOTE multiplier,
+    not the strike times the delivered share count.
+
+    Using strike x shares fabricated value: a 50-share deliverable at strike 100
+    with spot 110 paid $5,000 for $5,500 of stock on a contract whose true payoff
+    under max(A*S_T + C - K*M, 0) was zero.
+    """
+
+    CV = 1
+    STRIKE = 100.0
+    MULTIPLIER = 100
+    DELIVERED = 50
+
+    def _run(self, spot: float):
+        c = make_contract(self.CV, strike=self.STRIKE, expiry_day=5,
+                          multiplier=self.MULTIPLIER, deliverable_shares=self.DELIVERED)
+        h = EngineHarness(base_config(cash=500_000.0), [c])
+        for day in (1, 2):
+            h.bar(day_ns(day), [make_bar(self.CV, timestamp_ns=day_ns(day), price=5.00)],
+                  underlying={"TEST": spot},
+                  groups=[group(buy(self.CV, 1))] if day == 1 else None)
+        h.engine.end_session(day_ns(6))
+        return h
+
+    def test_it_expires_worthless_when_delivered_value_is_below_the_aggregate(self):
+        """50 x 110 = 5,500 against an aggregate of 100 x 100 = 10,000."""
+        h = self._run(110.0)
+        assert h.finalize().exercise_count == 0
+        assert h.shares_of("TEST") == 0
+
+    def test_it_exercises_when_delivered_value_exceeds_the_aggregate(self):
+        """50 x 250 = 12,500 against 10,000, so the payoff is 2,500."""
+        h = self._run(250.0)
+        metrics = h.finalize()
+        assert metrics.exercise_count == 1
+        assert h.shares_of("TEST") == self.DELIVERED
+        # Payoff 2,500 less the 5.00 x 100 premium paid.
+        assert metrics.net_pnl == pytest.approx(2_500.0 - 5.00 * self.MULTIPLIER)
+
+    def test_a_fractional_deliverable_is_refused(self):
+        """OCC settles the fraction in cash-in-lieu, which this engine lacks."""
+        c = make_contract(self.CV, strike=100.0, expiry_day=5, multiplier=100)
+        c.deliverable_equity_microshares = 66_666_667
+        h = EngineHarness(base_config(cash=500_000.0), [c])
+        for day in (1, 2):
+            h.bar(day_ns(day), [make_bar(self.CV, timestamp_ns=day_ns(day), price=5.00)],
+                  underlying={"TEST": 200.0},
+                  groups=[group(buy(self.CV, 1))] if day == 1 else None)
+        h.engine.end_session(day_ns(6))
+        assert h.finalize().truncated
+        assert h.shares_of("TEST") == 0
+
+    def test_the_exercise_threshold_scales_with_the_deliverable(self):
+        """One cent per share, so $1.00 on a standard contract and $0.50 here."""
+        assert E.aggregate_exercise_threshold(100) == pytest.approx(1.00)
+        assert E.aggregate_exercise_threshold(50) == pytest.approx(0.50)
+        assert E.aggregate_exercise_threshold(400) == pytest.approx(4.00)

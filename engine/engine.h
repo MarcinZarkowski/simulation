@@ -34,8 +34,19 @@ enum class AssignmentPolicy : uint8_t {
     ConservativeEarlyAssignment,
 };
 
-// OCC exercise-by-exception threshold: one cent in the money.
+// OCC exercise-by-exception threshold, per share: one cent in the money
+// (OCC Rule 805(d)(2)).
 inline Money automatic_exercise_threshold() { return Money::from_double(0.01); }
+
+// The same threshold expressed against a contract's aggregate payoff. For a
+// standard 100-share contract this is $1.00, which is also what OCC Rule 1804
+// specifies for a cash-settled contract with a multiplier, so one expression
+// covers both. Scaling by the deliverable matters for an adjusted contract: a
+// flat $0.01 against an aggregate payoff would exercise anything a hundredth of
+// a cent per share in the money.
+inline Money aggregate_exercise_threshold(int64_t shares_per_contract) {
+    return Money{automatic_exercise_threshold().micros * shares_per_contract};
+}
 
 struct RiskLimits {
     int64_t max_open_positions = 0;          // 0 disables the limit
@@ -517,6 +528,12 @@ private:
         return f;
     }
 
+    // Whether a price for this underlying was actually observed, as opposed to
+    // defaulting to zero.
+    bool has_observed_underlying(const std::string& sym) const {
+        return current_.underlying_price.count(sym) || last_underlying_.count(sym);
+    }
+
     Money underlying_of(const std::string& sym) const {
         auto it = current_.underlying_price.find(sym);
         if (it != current_.underlying_price.end()) return it->second;
@@ -876,14 +893,31 @@ private:
             const OptionContractVersion* c = registry_.find(p.contract_version_id);
             if (c == nullptr || c->expiration > cutoff) continue;
 
+            // Settlement needs an observed underlying price. Falling back to zero
+            // made a put maximally in the money and settled it at a fabricated
+            // price -- measured at +$9,500 of invented profit and a 100-share
+            // short -- while a call silently expired worthless. Neither was
+            // flagged, so refuse instead.
+            if (!has_observed_underlying(c->underlying_symbol)) {
+                quarantine(p.contract_version_id, p.quantity,
+                           "no observed underlying price at settlement");
+                continue;
+            }
+            if (c->has_fractional_deliverable()) {
+                quarantine(p.contract_version_id, p.quantity,
+                           "fractional deliverable requires cash-in-lieu settlement");
+                continue;
+            }
+
             const Money spot = underlying_of(c->underlying_symbol);
-            const Money intrinsic = (c->type == OptionType::Call)
-                ? max_money(spot - c->strike, Money::zero())
-                : max_money(c->strike - spot, Money::zero());
+            // Per-contract payoff from the actual deliverable, aggregated against
+            // the listed strike times the quote multiplier.
+            const Money intrinsic = c->payoff_at(spot);
 
             const bool exercise =
                 cfg_.assignment_policy != AssignmentPolicy::ExpirationOnly
-                && intrinsic >= automatic_exercise_threshold();
+                && intrinsic >= aggregate_exercise_threshold(
+                       c->deliverable_shares_per_contract());
 
             const Money entry_avg = p.average_cost();
             const bool was_short = p.quantity < 0;
@@ -920,9 +954,11 @@ private:
     // short call assigned without shares establishes a short stock position
     // rather than settling to cash.
     void settle_physically(const OptionContractVersion& c, int64_t contracts, Money spot) {
-        const int64_t shares_per = c.deliverable_shares_per_contract();
-        const int64_t shares = shares_per * (contracts < 0 ? -contracts : contracts);
-        const Money strike_cash = Money{c.strike.micros * shares};
+        const int64_t count = contracts < 0 ? -contracts : contracts;
+        const int64_t shares = c.deliverable_shares_per_contract() * count;
+        // The aggregate exercise price is the listed strike times the quote
+        // multiplier, not the strike times the delivered share count.
+        const Money strike_cash = Money{c.aggregate_exercise_price().micros * count};
 
         const bool long_position = contracts > 0;
         const bool call = c.type == OptionType::Call;
@@ -932,7 +968,12 @@ private:
         const int64_t share_delta = receives_shares ? shares : -shares;
         const Money cash_delta = receives_shares ? -strike_cash : strike_cash;
 
-        book_.apply_equity(c.underlying_symbol, share_delta, c.strike);
+        // Book the shares at the effective per-share cost implied by the
+        // aggregate exercise price, so basis is right for a non-standard
+        // deliverable rather than assuming the listed strike per share.
+        const Money share_cost = shares > 0
+            ? Money{strike_cash.micros / shares} : c.strike;
+        book_.apply_equity(c.underlying_symbol, share_delta, share_cost);
         ledger_.post(now_,
                      long_position ? LedgerEntryKind::ExerciseSettlement
                                    : LedgerEntryKind::AssignmentSettlement,
