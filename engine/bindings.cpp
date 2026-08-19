@@ -123,7 +123,9 @@ PYBIND11_MODULE(obt_engine, m) {
         .value("LIMIT_NOT_SATISFIED", RejectReason::LimitNotSatisfied)
         .value("GROUP_LEG_REJECTED", RejectReason::GroupLegRejected)
         .value("UNCONFIRMED_LINEAGE", RejectReason::UnconfirmedLineage)
-        .value("BROKER_DISALLOWED", RejectReason::BrokerDisallowed);
+        .value("BROKER_DISALLOWED", RejectReason::BrokerDisallowed)
+        .value("UNSUPPORTED_ORDER_TYPE", RejectReason::UnsupportedOrderType)
+        .value("UNSUPPORTED_INSTRUMENT_KIND", RejectReason::UnsupportedInstrumentKind);
 
     // ------------------------------------------------------------- contract
     py::class_<OptionContractVersion>(m, "OptionContractVersion")

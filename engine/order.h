@@ -36,6 +36,11 @@ enum class RejectReason : uint8_t {
     GroupLegRejected,
     UnconfirmedLineage,
     BrokerDisallowed,
+    // The order names a feature the engine does not implement. Refusing is the
+    // only honest response: silently approximating it produces a fill, a
+    // reconciling ledger, and a wrong answer.
+    UnsupportedOrderType,
+    UnsupportedInstrumentKind,
 };
 
 struct Order {
@@ -121,6 +126,8 @@ inline const char* to_string(RejectReason r) {
         case RejectReason::GroupLegRejected: return "group_leg_rejected";
         case RejectReason::UnconfirmedLineage: return "unconfirmed_lineage";
         case RejectReason::BrokerDisallowed: return "broker_disallowed";
+        case RejectReason::UnsupportedOrderType: return "unsupported_order_type";
+        case RejectReason::UnsupportedInstrumentKind: return "unsupported_instrument_kind";
     }
     return "unknown";
 }

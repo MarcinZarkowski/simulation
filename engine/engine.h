@@ -471,6 +471,26 @@ private:
         for (const Order& o : group.legs) {
             Planned p;
             p.order = o;
+
+            // A stop trigger cannot be honestly simulated from OHLC bars: the
+            // intrabar path is unknown, so there is no defensible instant at
+            // which the stop became live. Refusing is correct; the previous
+            // behavior silently ignored the stop price and executed at market,
+            // so a BUY STOP at $999 filled immediately against a $5.00 market.
+            if (o.type == OrderType::Stop || o.type == OrderType::StopLimit) {
+                reason = RejectReason::UnsupportedOrderType;
+                detail = "stop triggers cannot be simulated from bar data; use a limit";
+                break;
+            }
+            // Equity legs are not implemented. The kind flag was accepted and
+            // ignored, so an order for one share was priced with the contract's
+            // 100x multiplier and booked as an option.
+            if (o.kind != EquityKind::Option) {
+                reason = RejectReason::UnsupportedInstrumentKind;
+                detail = "equity orders are not implemented; shares arrive only via settlement";
+                break;
+            }
+
             p.contract = registry_.find(o.contract_version_id);
             if (p.contract == nullptr) { reason = RejectReason::ContractNotTradable; detail = "unknown contract version"; break; }
             if (!p.contract->covers(now_)) { reason = RejectReason::ContractNotTradable; detail = "contract version not valid at fill time"; break; }
@@ -647,6 +667,53 @@ private:
             if (shorts > cfg_.risk.max_short_option_contracts) {
                 *reason = RejectReason::RiskLimitBreached;
                 *detail = "max short option contracts";
+                return false;
+            }
+        }
+
+        // These four were declared, bound to Python, and never referenced, so
+        // configuring them silently ran the backtest unconstrained.
+        if (cfg_.risk.max_contracts_per_underlying > 0
+            || !cfg_.risk.max_notional_per_underlying.is_zero()
+            || cfg_.risk.max_abs_delta > 0.0) {
+            std::unordered_map<std::string, int64_t> contracts_by_underlying;
+            std::unordered_map<std::string, Money> notional_by_underlying;
+            double abs_delta = 0.0;
+
+            for (const Position& p : probe.snapshot()) {
+                if (p.kind != EquityKind::Option || p.quantity == 0) continue;
+                const OptionContractVersion* c = registry_.find(p.contract_version_id);
+                if (c == nullptr) continue;
+                const int64_t qty = p.abs_quantity();
+                contracts_by_underlying[c->underlying_symbol] += qty;
+                notional_by_underlying[c->underlying_symbol] +=
+                    Money{c->notional(underlying_of(c->underlying_symbol)).micros * qty};
+                const OptionAnalytics* a = analytics_for(p.contract_version_id);
+                if (a != nullptr && a->valid) abs_delta += a->delta * p.quantity;
+            }
+
+            if (cfg_.risk.max_contracts_per_underlying > 0) {
+                for (const auto& [sym, n] : contracts_by_underlying) {
+                    if (n > cfg_.risk.max_contracts_per_underlying) {
+                        *reason = RejectReason::RiskLimitBreached;
+                        *detail = "max contracts per underlying";
+                        return false;
+                    }
+                }
+            }
+            if (!cfg_.risk.max_notional_per_underlying.is_zero()) {
+                for (const auto& [sym, value] : notional_by_underlying) {
+                    if (value > cfg_.risk.max_notional_per_underlying) {
+                        *reason = RejectReason::RiskLimitBreached;
+                        *detail = "max notional per underlying";
+                        return false;
+                    }
+                }
+            }
+            if (cfg_.risk.max_abs_delta > 0.0
+                && std::fabs(abs_delta) > cfg_.risk.max_abs_delta) {
+                *reason = RejectReason::RiskLimitBreached;
+                *detail = "max absolute portfolio delta";
                 return false;
             }
         }

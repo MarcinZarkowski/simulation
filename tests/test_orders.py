@@ -494,3 +494,61 @@ class TestLedgerReconciliation:
 
         assert sum(e.amount_micros for e in h.engine.ledger_entries()) == h.cash_micros
         assert h.engine.ledger_reconciles()
+
+
+class TestUnsupportedFeaturesRefuse:
+    """
+    A declared feature that silently approximates is worse than one that is
+    absent: it fills, the ledger reconciles, and the answer is wrong.
+    """
+
+    @pytest.mark.parametrize("order_type", [E.OrderType.STOP, E.OrderType.STOP_LIMIT])
+    def test_stop_orders_are_refused_rather_than_filled_at_market(self, engine, order_type):
+        """
+        A stop trigger cannot be located within a bar, so there is no defensible
+        instant at which it became live. Previously the stop price was ignored and
+        the order executed at market: a BUY STOP at $999 filled against a $5.00
+        market with no rejection.
+        """
+        h = engine()
+        o = buy(CALL_100)
+        o.type = order_type
+        o.stop_price = 999.0
+        h.bar(day_ns(1), bars_at(1, {CALL_100: 5.00}), groups=[group(o)])
+        h.bar(day_ns(2), bars_at(2, {CALL_100: 5.00}))
+
+        assert len(h.fills()) == 0
+        assert reasons(h) == [E.RejectReason.UNSUPPORTED_ORDER_TYPE]
+
+    def test_equity_orders_are_refused_rather_than_booked_as_options(self, engine):
+        """
+        The kind flag was accepted and ignored, so an order for one share was
+        priced with the contract's 100x multiplier: 1 share at $100 moved $10,000
+        and created an option position.
+        """
+        h = engine()
+        o = buy(CALL_100)
+        o.kind = E.EquityKind.EQUITY
+        h.bar(day_ns(1), bars_at(1, {CALL_100: 5.00}), groups=[group(o)])
+        h.bar(day_ns(2), bars_at(2, {CALL_100: 5.00}))
+
+        assert len(h.fills()) == 0
+        assert reasons(h) == [E.RejectReason.UNSUPPORTED_INSTRUMENT_KIND]
+
+    def test_refusing_one_leg_refuses_the_whole_group(self, engine):
+        h = engine()
+        bad = buy(CALL_110)
+        bad.type = E.OrderType.STOP
+        h.bar(day_ns(1), bars_at(1, {CALL_100: 5.00, CALL_110: 2.00}),
+              groups=[group(buy(CALL_100), bad)])
+        h.bar(day_ns(2), bars_at(2, {CALL_100: 5.00, CALL_110: 2.00}))
+
+        assert len(h.fills()) == 0
+        assert h.positions() == []
+
+    def test_market_and_limit_orders_still_fill(self, engine):
+        h = engine()
+        h.bar(day_ns(1), bars_at(1, {CALL_100: 5.00}),
+              groups=[group(buy(CALL_100, limit_price=6.00))])
+        h.bar(day_ns(2), bars_at(2, {CALL_100: 5.00}))
+        assert len(h.fills()) == 1
