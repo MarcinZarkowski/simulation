@@ -237,6 +237,25 @@ def sell_shares(symbol: str, quantity: int, **kw) -> E.Order:
     return shares(symbol, E.OrderSide.SELL, quantity, **kw)
 
 
+def exercise(contract_version_id: int, quantity: int = 1, *, tag: str = "") -> E.Order:
+    """
+    A voluntary exercise of a long position.
+
+    Not priced and crosses no spread: the holder gives up the contract and takes
+    the deliverable at the aggregate exercise price. An order rather than a separate
+    call so it can be submitted atomically with whatever replaces the position, and
+    so it is rejected through the same path with the same named reasons.
+    """
+    o = E.Order()
+    o.contract_version_id = contract_version_id
+    o.side = E.OrderSide.SELL
+    o.quantity = quantity
+    o.type = E.OrderType.EXERCISE
+    o.reduce_only = True
+    o.tag = tag
+    return o
+
+
 def group(*legs: E.Order, group_id: int | None = None) -> E.OrderGroup:
     """
     Bundle legs into one atomic order.

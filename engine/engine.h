@@ -782,11 +782,99 @@ private:
         metrics_.spread_cost += f.spread_cost();
     }
 
+    // Plans a voluntary exercise. Not priced and crosses no spread: the holder
+    // gives up the contract and takes the deliverable at the aggregate exercise
+    // price.
+    template <typename PlannedT>
+    bool plan_exercise_leg(const Order& o, PlannedT& p,
+                           RejectReason* reason, std::string* detail)
+    {
+        p.is_exercise = true;
+        p.contract = registry().find(o.contract_version_id);
+        if (p.contract == nullptr) {
+            *reason = RejectReason::ContractNotTradable;
+            *detail = "unknown contract version";
+            return false;
+        }
+        p.multiplier = p.contract->quote_multiplier;
+
+        const int64_t held = book_.quantity_of(o.contract_version_id);
+        if (held <= 0) {
+            *reason = RejectReason::NotExercisable;
+            *detail = "only a long position can be exercised";
+            return false;
+        }
+        if (o.quantity <= 0 || o.quantity > held) {
+            *reason = RejectReason::NotExercisable;
+            *detail = "exercise quantity exceeds the position";
+            return false;
+        }
+        // A European contract cannot be exercised before expiration -- that is what
+        // European means, and the expiration path handles it there.
+        if (!p.contract->is_american && now_ < p.contract->expiration) {
+            *reason = RejectReason::NotExercisable;
+            *detail = "a European contract cannot be exercised before expiration";
+            return false;
+        }
+        if (!has_observed_underlying(p.contract->underlying_symbol)) {
+            *reason = RejectReason::NoMarketData;
+            *detail = "no observed underlying price to settle against";
+            return false;
+        }
+        if (!p.contract->is_cash_settled() && p.contract->has_fractional_deliverable()) {
+            *reason = RejectReason::NotExercisable;
+            *detail = "fractional deliverable requires cash-in-lieu settlement";
+            return false;
+        }
+        return true;
+    }
+
+    // Removes the exercised contracts at zero and books the deliverable. Deliberately
+    // does NOT check moneyness: exercising a contract that is out of the money is a
+    // legal thing for a holder to do, and an engine that silently refuses it is
+    // deciding strategy.
+    template <typename PlannedT>
+    void apply_exercise(const PlannedT& p, uint64_t group_id) {
+        const OptionContractVersion& c = *p.contract;
+        const int64_t count = p.order.quantity;
+        const Position* existing = book_.find(p.order.contract_version_id);
+        const Money prior_avg = existing ? existing->average_cost() : Money::zero();
+        const Timestamp opened_at = existing ? existing->opened_at : now_;
+
+        const ApplyFillResult applied = book_.apply(
+            p.order.contract_version_id, EquityKind::Option, -count,
+            Money::zero(), p.multiplier, now_);
+        record_trade(TradeRecord{
+            next_trade_id_++, p.order.contract_version_id, 0, group_id,
+            opened_at, now_, count, false,
+            Money{prior_avg.micros / p.multiplier}, Money::zero(),
+            applied.realized_pnl, applied.round_trip_fees,
+            applied.round_trip_spread_cost, CloseReason::Exercised, p.multiplier,
+        });
+
+        const Money spot = settlement_spot(c);
+        if (c.is_cash_settled()) settle_in_cash(c, count, spot);
+        else settle_physically(c, count, spot);
+        metrics_.exercise_count++;
+
+        Fill f;
+        f.order_id = p.order.order_id;
+        f.group_id = group_id;
+        f.filled_at = now_;
+        f.contract_version_id = p.order.contract_version_id;
+        f.side = OrderSide::Sell;
+        f.quantity = count;
+        f.multiplier = p.multiplier;
+        fills_.push_back(f);
+        metrics_.fill_count++;
+    }
+
     void execute_group(OrderGroup& group, bool use_open) {
         struct Planned {
             Order order;
             const OptionContractVersion* contract = nullptr;
             bool is_equity = false;
+            bool is_exercise = false;
             Money mark{};
             Money half_spread{};
             Money fill_price{};
@@ -814,6 +902,12 @@ private:
                 reason = RejectReason::UnsupportedOrderType;
                 detail = "stop triggers cannot be simulated from bar data; use a limit";
                 break;
+            }
+            if (o.type == OrderType::Exercise) {
+                if (!plan_exercise_leg(o, p, &reason, &detail)) break;
+                plan.push_back(p);
+                leg_index++;
+                continue;
             }
             if (o.kind == EquityKind::Equity) {
                 if (!plan_equity_leg(o, use_open, leg_index, p, &reason, &detail)) break;
@@ -909,9 +1003,18 @@ private:
                 for (const Planned& p : plan) {
                     const int64_t q = (p.order.side == OrderSide::Buy) ? p.order.quantity
                                                                        : -p.order.quantity;
-                    if (p.is_equity) probe.apply_equity(p.order.symbol, q, p.fill_price);
-                    else probe.apply(p.order.contract_version_id, EquityKind::Option, q,
-                                     p.fill_price, p.multiplier, now_);
+                    if (p.is_exercise) {
+                        // Exercising removes the option and books the deliverable.
+                        // Probing it as a simple close is conservative: it never
+                        // credits the new share position's loan value.
+                        probe.apply(p.order.contract_version_id, EquityKind::Option,
+                                    -p.order.quantity, Money::zero(), p.multiplier, now_);
+                    } else if (p.is_equity) {
+                        probe.apply_equity(p.order.symbol, q, p.fill_price);
+                    } else {
+                        probe.apply(p.order.contract_version_id, EquityKind::Option, q,
+                                    p.fill_price, p.multiplier, now_);
+                    }
                 }
             }, plan, &reason, &detail)) {
             reject_group(group, reason, detail);
@@ -921,6 +1024,10 @@ private:
         for (const Planned& p : plan) {
             const int64_t signed_qty = (p.order.side == OrderSide::Buy) ? p.order.quantity
                                                                         : -p.order.quantity;
+            if (p.is_exercise) {
+                apply_exercise(p, group.group_id);
+                continue;
+            }
             if (p.is_equity) {
                 apply_equity_fill(p, group.group_id, signed_qty);
                 continue;

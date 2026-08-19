@@ -9,7 +9,13 @@
 namespace obt {
 
 enum class OrderSide : uint8_t { Buy, Sell };
-enum class OrderType : uint8_t { Market, Limit, Stop, StopLimit };
+// Exercise is an order rather than a separate call so it inherits the group
+// machinery: it can be submitted atomically with the hedge that replaces it, and
+// it is rejected through the same path with the same named reasons.
+//
+// It is not priced and crosses no spread. AssignmentPolicy::ExplicitExerciseOnly
+// was selectable without it, which made the engine settle nothing at all.
+enum class OrderType : uint8_t { Market, Limit, Stop, StopLimit, Exercise };
 enum class TimeInForce : uint8_t { Day, GoodTilCanceled, FillOrKill };
 
 // When a signal turns into a fill. The default avoids same-bar lookahead: a
@@ -41,6 +47,9 @@ enum class RejectReason : uint8_t {
     // reconciling ledger, and a wrong answer.
     UnsupportedOrderType,
     UnsupportedInstrumentKind,
+    // An exercise the holder is not in a position to make: not long, more
+    // contracts than held, or a European contract before expiration.
+    NotExercisable,
 };
 
 struct Order {

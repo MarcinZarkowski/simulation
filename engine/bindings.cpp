@@ -69,7 +69,8 @@ PYBIND11_MODULE(obt_engine, m) {
         .value("MARKET", OrderType::Market)
         .value("LIMIT", OrderType::Limit)
         .value("STOP", OrderType::Stop)
-        .value("STOP_LIMIT", OrderType::StopLimit);
+        .value("STOP_LIMIT", OrderType::StopLimit)
+        .value("EXERCISE", OrderType::Exercise);
 
     py::enum_<TimeInForce>(m, "TimeInForce")
         .value("DAY", TimeInForce::Day)
@@ -139,7 +140,8 @@ PYBIND11_MODULE(obt_engine, m) {
         .value("UNCONFIRMED_LINEAGE", RejectReason::UnconfirmedLineage)
         .value("BROKER_DISALLOWED", RejectReason::BrokerDisallowed)
         .value("UNSUPPORTED_ORDER_TYPE", RejectReason::UnsupportedOrderType)
-        .value("UNSUPPORTED_INSTRUMENT_KIND", RejectReason::UnsupportedInstrumentKind);
+        .value("UNSUPPORTED_INSTRUMENT_KIND", RejectReason::UnsupportedInstrumentKind)
+        .value("NOT_EXERCISABLE", RejectReason::NotExercisable);
 
     // ------------------------------------------------------------- contract
     py::class_<OptionContractVersion>(m, "OptionContractVersion")
