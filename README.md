@@ -33,7 +33,7 @@ optionsbacktester/        Python layer
   report.py               path aggregation and reporting
   cli.py                  command line entry point
   strategies/             worked strategies, including a poor man's covered call
-tests/                    392 tests
+tests/                    750 tests
   fixtures.py             deterministic synthetic lake in the pipeline's schema
 ```
 
@@ -128,10 +128,42 @@ charges an iron condor its wider side rather than the sum of both.
 short, so the requirement is the debit paid. Short calls can be written against
 one long leg repeatedly until it expires.
 
-**Settlement is physical.** An assigned short call delivers shares and
-establishes a short stock position if none are held, which is what makes covered
-calls and diagonals behave correctly. Exercise-by-exception is $0.01 of
-intrinsic.
+**Settlement follows the contract.** An equity option delivers shares: an assigned
+short call establishes a short stock position if none are held, which is what makes
+covered calls and diagonals behave correctly. An index option settles in cash and
+touches no share position, preferring a published settlement value (SET, VRO) over
+the last observed spot. Exercise-by-exception is one cent per share, so $1.00 on a
+standard contract, which is also OCC's figure for a cash-settled one.
+
+The aggregate exercise price is the listed strike times the QUOTE multiplier, not
+times the delivered share count. They differ for an adjusted contract, and OCC's
+reverse-split rule freezes the multiplier for exactly this purpose: the holder of a
+1-for-10 adjusted $50 call still pays $5,000 and receives 10 shares.
+
+**Shares are tradable directly.** A covered call, collar or protective put can be
+opened rather than only inherited from a settlement. Equity legs use their own penny
+grid and their own per-share fee schedule, because pricing shares through the option
+spread model would charge a covered call more to buy its stock than to sell its call.
+
+**Exercise is an order.** A strategy can submit one, atomically with whatever
+replaces the position. Exercising an out-of-the-money contract is permitted, because
+it is legal and occasionally rational and an engine that silently refuses it is
+deciding strategy.
+
+**Dividends are paid.** Accrued at ex-date on the share position, paid at the pay
+date weeks later, owed on short shares, and gated on the declaration date so a
+backtest cannot collect an unannounced payout. Under the conservative assignment
+policy a short call is assigned before ex-date when the dividend exceeds the
+extrinsic value the holder gives up, decided on the PRIOR session's close because the
+underlying opens ex-date lower.
+
+**Contract terms are point-in-time.** A fill is gated both on when terms took effect
+and on when they became knowable, and opening a position on an adjusted contract whose
+terms are not established as point-in-time is refused.
+
+**Marks go stale.** A carried-forward mark past its age limit values the position at
+intrinsic against a fresh spot instead, and the oldest mark behind any valuation is
+reported. A contract that stops printing used to mark the book forever.
 
 ## Reporting
 
@@ -145,12 +177,30 @@ stochastic spread cost.
 - **Spread cost is a modeled assumption.** Without calibration against real quote
   history the interval is sensitivity analysis, not a forecast. The pipeline does
   not supply NBBO quotes, so the default parameters are illustrative.
-- **No early assignment is modeled** beyond expiration. The default policy is
-  automatic ITM exercise at expiration; a short option is not assigned early even
-  when a dividend would make it rational.
-- **Margin is a documented approximation, not broker-validated.** The Robinhood
-  model follows published rules and refuses uncovered short calls as the real
-  broker does, but it has not been reconciled against live broker statements.
+- **Early assignment covers the dividend case only.** Under
+  `conservative_early_assignment` a short call is assigned before an ex-dividend date
+  when the dividend exceeds its extrinsic value. A deep in-the-money short put
+  assigned for the interest on its strike is not modelled.
+- **Margin is a documented approximation, not broker-validated.** The Robinhood model
+  follows rules checked against Robinhood's own help centre and fee schedule --
+  including that no approval level permits an uncovered short call, that short puts
+  are held at the full strike in both cash and margin accounts, and that short stock
+  carries the published 130% rather than the Reg-T 150%. It has not been reconciled
+  against a live broker statement, and Robinhood's house requirements are
+  model-driven and undisclosed.
+- **There is no portfolio-margin model.** One existed as an alias for Reg-T while the
+  manifest recorded it as `portfolio_approx`, which named a methodology the run had
+  not applied. It was removed rather than implemented: Robinhood does not offer
+  portfolio margin, and its 100% maintenance requirement on long options is
+  incompatible with it.
+- **The equity spread contributes no dispersion at typical prices.** At the default
+  1 bp, a $100 stock's modelled half-spread is exactly the half-cent floor, so every
+  draw is clamped. That is economically right -- a penny is the minimum tick and a
+  liquid stock at that price quotes one cent wide -- but the stochastic term only bites
+  above roughly $100.
+- **Open interest is a current snapshot, not history.** The pipeline can source it
+  from OCC free of charge, but OCC offers no way to ask for a past date, so it is null
+  for every day already in the lake.
 - **Lineage is fail-closed and mostly unconfirmed.** The pipeline currently
   produces adjustment candidates without OCC memo confirmation, so a position
   held through an adjustment is refused rather than converted. This is deliberate:

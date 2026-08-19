@@ -65,14 +65,6 @@ struct RiskLimits {
     double max_margin_usage_fraction = 0.0;
     int64_t max_short_option_contracts = 0;
     double max_abs_delta = 0.0;
-
-    bool any_enabled() const {
-        return max_open_positions || max_contracts_per_underlying
-            || !max_notional_per_underlying.is_zero() || !max_loss_per_trade.is_zero()
-            || !max_daily_loss.is_zero() || max_drawdown_fraction > 0.0
-            || max_margin_usage_fraction > 0.0 || max_short_option_contracts
-            || max_abs_delta > 0.0;
-    }
 };
 
 struct BacktestConfig {

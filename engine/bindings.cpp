@@ -177,6 +177,15 @@ PYBIND11_MODULE(obt_engine, m) {
             return c.tradable_at(Timestamp{t});
         }, py::arg("timestamp_ns"))
         .def_property_readonly("is_cash_settled", &OptionContractVersion::is_cash_settled)
+        .def("payoff_at", [](const OptionContractVersion& c, double underlying) {
+            return c.payoff_at(money_from(underlying)).to_double();
+        }, py::arg("underlying"))
+        .def("delivered_value", [](const OptionContractVersion& c, double underlying) {
+            return c.delivered_value(money_from(underlying)).to_double();
+        }, py::arg("underlying"))
+        .def_property_readonly("aggregate_exercise_price", [](const OptionContractVersion& c) {
+            return c.aggregate_exercise_price().to_double();
+        })
         .def("known_at", [](const OptionContractVersion& c, int64_t t) {
             return c.known_at(Timestamp{t});
         }, py::arg("timestamp_ns"))

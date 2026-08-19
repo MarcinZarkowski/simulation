@@ -334,3 +334,96 @@ class TestPairingPrefersTheEarliestExpiringShort:
         paired = [p for p in result.pairings if not p.naked]
         assert len(paired) == 1
         assert paired[0].short_leg == 1        # the 30-day short, not the 90-day one
+
+
+class TestADeliverableCashComponentIsAdded:
+    """
+    Kills: contract.h `delivered_value` `+ deliverable_cash` -> `-`.
+
+    A stock-and-cash merger leaves a contract delivering shares PLUS a fixed cash
+    amount, and the sign of that cash decides whether the holder receives it or pays
+    it. No test had a non-zero cash component reach the payoff, so flipping the sign
+    was invisible -- on precisely the contracts whose terms are already unusual.
+    """
+
+    def _contract(self, cash: float):
+        c = make_contract(CALL, strike=100.0, expiry_day=6, multiplier=100,
+                          deliverable_shares=50, is_adjusted=True)
+        c.deliverable_cash = cash
+        c.terms_provenance = E.TermsProvenance.POINT_IN_TIME
+        return c
+
+    def _settle(self, cash: float, spot: float = 200.0) -> float:
+        contract = self._contract(cash)
+        h = EngineHarness(base_config(cash=100_000.0, margin=E.MarginModel.REG_T),
+                          [contract])
+        for day in (1, 2):
+            h.engine.begin_bar(snapshot(day, {CALL: 20.0}, spot=spot))
+            if day == 1:
+                h.engine.submit_group(group(buy(CALL, 1)))
+            h.engine.end_bar()
+        assert h.quantity_of(CALL) == 1
+        h.engine.begin_bar(snapshot(6, {CALL: 20.0}, spot=spot))
+        h.engine.end_bar()
+        h.engine.end_session(day_ns(6) + SESSION)
+        return h.engine.account_state().equity
+
+    def test_the_cash_component_is_worth_its_face_value_at_settlement(self):
+        """
+        50 shares at 200 is $10,000 delivered, plus $500 of cash, against an aggregate
+        exercise price of 100 x 100 = $10,000. So the cash component is the ENTIRE
+        payoff: with it the contract exercises and is worth $500, without it the payoff
+        is zero and it expires worthless.
+
+        Compared on EQUITY rather than cash, because the two cases end in different
+        shapes -- the exercised one spends cash to acquire shares -- and comparing cash
+        alone made the profitable case look worse.
+        """
+        with_cash = self._settle(500.0)
+        without = self._settle(0.0)
+
+        assert with_cash - without == pytest.approx(500.0)
+
+    def test_the_payoff_itself_includes_it(self):
+        """Asserted directly on the contract, not only through settlement."""
+        assert self._contract(500.0).payoff_at(200.0) == pytest.approx(500.0)
+        assert self._contract(0.0).payoff_at(200.0) == pytest.approx(0.0)
+
+    def test_a_cash_component_can_make_an_otherwise_worthless_contract_pay(self):
+        plain = self._contract(0.0)
+        with_cash = self._contract(1_000.0)
+
+        assert plain.payoff_at(190.0) == pytest.approx(0.0)
+        assert with_cash.payoff_at(190.0) == pytest.approx(500.0)
+
+
+class TestTheNotionalLimitBoundary:
+    """
+    Kills: engine.h `value > max_notional_per_underlying` -> `>=`.
+
+    The earlier test only covered a limit well above and well below the position, so
+    the boundary itself -- notional exactly equal to the limit -- was never exercised
+    and the comparison could be either strict or not.
+    """
+
+    def _fills(self, limit: float) -> int:
+        contract = make_contract(CALL, strike=100.0, expiry_day=400)
+        cfg = base_config(cash=100_000.0, margin=E.MarginModel.REG_T)
+        cfg.risk.max_notional_per_underlying = limit
+        h = EngineHarness(cfg, [contract])
+        for day in (1, 2):
+            h.engine.begin_bar(snapshot(day, {CALL: 5.0}))
+            if day == 1:
+                h.engine.submit_group(group(buy(CALL, 1)))
+            h.engine.end_bar()
+        return len(h.fills())
+
+    def test_notional_exactly_at_the_limit_is_permitted(self):
+        """
+        One contract on a $100 underlying controls $10,000. A limit OF $10,000 is a
+        limit the position meets, not one it breaches.
+        """
+        assert self._fills(10_000.0) == 1
+
+    def test_one_microdollar_over_the_limit_is_refused(self):
+        assert self._fills(9_999.999999) == 0

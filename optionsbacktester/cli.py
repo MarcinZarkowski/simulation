@@ -123,6 +123,14 @@ def build_config(args: argparse.Namespace) -> tuple[E.BacktestConfig, dict]:
     cfg.require_occ_confirmed_lineage = not args.allow_unconfirmed_lineage
     cfg.reject_fallback_analytics = not args.allow_fallback_analytics
     cfg.reject_stale_bars = not args.allow_stale_bars
+    cfg.require_point_in_time_terms = not args.allow_backfilled_terms
+    cfg.require_monotonic_time = not args.allow_repeated_timestamps
+    cfg.mark_age_limit_ns = int(args.mark_age_limit_days * 86_400 * 1_000_000_000)
+    cfg.equity_curve_resolution = (
+        E.EquityCurveResolution.PER_BAR if args.equity_curve == "bar"
+        else E.EquityCurveResolution.PER_SESSION
+    )
+    cfg.max_retained_records = args.max_retained_records
     if args.zero_fees:
         cfg.fees = E.FeeSchedule.zero()
     calibration = apply_calibration(cfg.spread_model, args.spread_calibration)
@@ -187,6 +195,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--allow-unconfirmed-lineage", action="store_true",
                    help="carry positions through adjustments with no OCC-confirmed "
                         "lineage; unsafe, and off by default")
+    p.add_argument("--allow-backfilled-terms", action="store_true",
+                   help="open positions on adjusted contracts whose terms were "
+                        "inferred from a later snapshot; that is lookahead, and off "
+                        "by default")
+    p.add_argument("--allow-repeated-timestamps", action="store_true",
+                   help="accept bars that do not advance in time; two bars at one "
+                        "instant let an order fill on the bar it was submitted from")
+    p.add_argument("--mark-age-limit-days", type=float, default=3.0,
+                   help="how old a carried-forward mark may be before a position is "
+                        "valued at intrinsic instead; 0 disables the bound")
+    p.add_argument("--equity-curve", choices=("session", "bar"), default="session",
+                   help="how often to record an equity point. Per bar is 390x larger "
+                        "on a minute feed and changes no statistic, since peak equity "
+                        "and max drawdown are tracked exactly on every bar regardless")
+    p.add_argument("--max-retained-records", type=int, default=1_000_000,
+                   help="cap on retained fills, trades and rejections per path; "
+                        "0 is unbounded. Dropped records are counted, never hidden")
     p.add_argument("--zero-fees", action="store_true")
     p.add_argument("--allow-incomplete-days", action="store_true",
                    help="include days the pipeline did not mark complete")
