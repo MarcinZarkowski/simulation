@@ -300,3 +300,79 @@ class TestSpreadExpiration:
         assert h.quantity_of(1) == 0
         assert h.quantity_of(2) == 0
         assert h.engine.ledger_reconciles()
+
+
+class TestSessionCloseSettlement:
+    """
+    Expiration is an instant no bar occupies.
+
+    Contracts expire at the 16:00 ET close while minute bars are stamped at minute
+    start, so the last bar of the day is 15:59 and a settlement rule keyed on
+    `expiration <= bar_timestamp` never fires on the expiration date. It deferred
+    every expiry to the next session's open, injecting an overnight or weekend gap
+    into the settlement price of every expiring position.
+    """
+
+    CALL = 1
+    EXPIRATION = day_ns(19) + 21 * 3600 * 10**9      # 16:00 ET on day 19
+    LAST_BAR = day_ns(19) + 20 * 3600 * 10**9 + 59 * 60 * 10**9   # 15:59 ET
+    NEXT_SESSION_CLOSE = day_ns(20)
+
+    def _contract(self):
+        c = make_contract(self.CALL, strike=100.0, expiry_day=19)
+        c.expiration = self.EXPIRATION
+        c.valid_to = self.EXPIRATION
+        return c
+
+    def _held_position(self, spot_at_last_bar: float):
+        """Buys one call, then walks to the final 15:59 bar of expiration day."""
+        h = EngineHarness(base_config(cash=100_000.0), [self._contract()])
+        first = day_ns(19) + 20 * 3600 * 10**9
+        h.bar(first, [make_bar(self.CALL, timestamp_ns=first, price=5.00)],
+              underlying={"TEST": 100.0}, groups=[group(buy(self.CALL, 1))])
+        h.bar(self.LAST_BAR, [make_bar(self.CALL, timestamp_ns=self.LAST_BAR, price=5.00)],
+              underlying={"TEST": spot_at_last_bar})
+        return h
+
+    def test_position_is_still_open_after_the_last_bar(self):
+        """No bar reaches the expiration instant, so end_bar alone cannot settle."""
+        h = self._held_position(120.0)
+        assert h.quantity_of(self.CALL) == 1
+
+    def test_session_close_settles_on_the_expiration_date(self):
+        h = self._held_position(120.0)
+        h.engine.end_session(self.NEXT_SESSION_CLOSE)
+        assert h.quantity_of(self.CALL) == 0
+        assert h.finalize().exercise_count == 1
+
+    def test_settlement_uses_the_expiration_day_spot_not_the_next_session(self):
+        """
+        The shares must be acquired at the strike against the expiration day's
+        closing spot. Settling a session later would substitute the next open,
+        which is where the overnight gap entered.
+        """
+        h = self._held_position(120.0)
+        h.engine.end_session(self.NEXT_SESSION_CLOSE)
+        assert h.shares_of("TEST") == 100
+        assert h.engine.ledger_reconciles()
+
+    def test_out_of_the_money_at_the_close_expires_worthless(self):
+        h = self._held_position(95.0)
+        h.engine.end_session(self.NEXT_SESSION_CLOSE)
+        metrics = h.finalize()
+        assert metrics.exercise_count == 0
+        assert metrics.expiration_count == 1
+        assert h.shares_of("TEST") == 0
+
+    def test_a_session_close_before_expiration_settles_nothing(self):
+        h = self._held_position(120.0)
+        h.engine.end_session(day_ns(19))
+        assert h.quantity_of(self.CALL) == 1
+
+    def test_session_close_is_idempotent(self):
+        h = self._held_position(120.0)
+        h.engine.end_session(self.NEXT_SESSION_CLOSE)
+        cash_after_first = h.cash_micros
+        h.engine.end_session(self.NEXT_SESSION_CLOSE)
+        assert h.cash_micros == cash_after_first
+        assert h.finalize().expiration_count == 1

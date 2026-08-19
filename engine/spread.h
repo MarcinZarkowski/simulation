@@ -102,6 +102,18 @@ struct SpreadModelConfig {
     // Lognormal / ConditionalLognormal, in log-basis-point space.
     double log_base = 4.0;          // exp(4.0) ~ 55 bps at the reference point
     double log_sigma = 0.45;
+
+    // Scales the dispersion of the drawn spread without touching its central
+    // tendency. 1.0 leaves the model as calibrated; 2.0 doubles the log-space
+    // standard deviation; 0.0 collapses every draw onto the mean, which turns the
+    // Monte Carlo into a single deterministic path.
+    //
+    // This is the knob for asking "how much of my result is owned by the spread
+    // assumption?". Because a lognormal's mean is exp(mu + sigma^2/2), changing
+    // sigma alone would also move the mean and confound level with dispersion, so
+    // preserve_mean_under_variance_scale compensates mu to hold E[spread] fixed.
+    double variance_scale = 1.0;
+    bool preserve_mean_under_variance_scale = true;
     double beta_iv = 0.90;
     double beta_log_dte = -0.15;
     double beta_log_volume = -0.12;
@@ -117,6 +129,18 @@ struct SpreadModelConfig {
     double max_fraction_of_mark = 0.50;
     // Quote grid: $0.01 below $3.00, $0.05 at or above, per exchange convention.
     bool round_to_tick = true;
+
+    double effective_sigma() const {
+        return log_sigma * (variance_scale < 0.0 ? 0.0 : variance_scale);
+    }
+
+    // Shifts mu so that scaling sigma does not move the distribution's mean.
+    // For a lognormal, mean = exp(mu + sigma^2/2), so holding the mean fixed
+    // while moving sigma requires mu' = mu + (sigma_0^2 - sigma^2)/2.
+    double mean_preserving_mu(double mu, double sigma) const {
+        if (!preserve_mean_under_variance_scale) return mu;
+        return mu + 0.5 * (log_sigma * log_sigma - sigma * sigma);
+    }
 };
 
 inline double tick_size_dollars(double mark_dollars) {
@@ -142,7 +166,9 @@ inline double half_spread_dollars(
             break;
 
         case SpreadModelKind::Lognormal: {
-            const double bps = std::exp(cfg.log_base + cfg.log_sigma * standard_normal(key));
+            const double sigma = cfg.effective_sigma();
+            const double bps = std::exp(cfg.mean_preserving_mu(cfg.log_base, sigma)
+                                        + sigma * standard_normal(key));
             half = f.mark_dollars * bps / 20000.0;
             break;
         }
@@ -154,7 +180,9 @@ inline double half_spread_dollars(
                 + cfg.beta_log_volume * std::log1p(std::max(0.0, f.volume))
                 + cfg.beta_abs_moneyness * std::fabs(f.moneyness)
                 + cfg.beta_minutes_from_open * f.minutes_from_open;
-            const double bps = std::exp(mu + cfg.log_sigma * standard_normal(key));
+            const double sigma = cfg.effective_sigma();
+            const double bps = std::exp(cfg.mean_preserving_mu(mu, sigma)
+                                        + sigma * standard_normal(key));
             half = f.mark_dollars * bps / 20000.0;
             break;
         }

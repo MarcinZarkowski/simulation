@@ -143,12 +143,20 @@ def _trading_days(start: date, count: int) -> list[date]:
 
 
 def _bar_times(day: date, bars: int) -> list[datetime]:
-    """Bars spread across the session, in tz-naive UTC like the pipeline."""
+    """
+    Bars spread across the regular session, in tz-naive UTC like the pipeline.
+
+    The last bar is 15:59 ET (20:59 UTC), never 16:00. Minute bars are stamped at
+    minute start, so no bar occupies the expiration instant -- and a fixture that
+    puts one there hides the whole class of bug where settlement is driven off a
+    bar timestamp instead of a session boundary.
+    """
     open_utc = datetime(day.year, day.month, day.day, 14, 30)
     if bars == 1:
         return [open_utc]
-    step = timedelta(minutes=int(390 / (bars - 1))) if bars > 1 else timedelta(0)
-    return [open_utc + i * step for i in range(bars)]
+    # 14:30 through 20:59 inclusive is 390 minute-bars; span the 389 gaps.
+    step = 389 / (bars - 1)
+    return [open_utc + timedelta(minutes=round(i * step)) for i in range(bars)]
 
 
 def build_day_frames(spec: LakeSpec, day_index: int, day: date) -> tuple[pl.DataFrame, pl.DataFrame]:

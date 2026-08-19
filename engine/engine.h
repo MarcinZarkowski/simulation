@@ -80,6 +80,49 @@ struct BacktestConfig {
     bool reject_stale_bars = true;
 };
 
+// Why a position stopped existing. Distinguishing these matters because a
+// strategy that never closes a trade voluntarily has a very different risk
+// profile from one that does, and expiries are not decisions.
+enum class CloseReason : uint8_t { Closed, Expired, Exercised, Assigned, Adjusted };
+
+// One closed round trip on one contract version. Emitted on every closing event,
+// including partial closes, so per-trade statistics are exact rather than
+// reconstructed from fills.
+struct TradeRecord {
+    uint64_t trade_id = 0;
+    ContractVersionId contract_version_id{};
+    uint64_t open_group_id = 0;
+    uint64_t close_group_id = 0;
+    Timestamp opened_at{};
+    Timestamp closed_at{};
+    // Contracts closed by this event, always positive.
+    int64_t quantity = 0;
+    bool was_short = false;
+    // Per-contract average entry cost and the exit price actually received.
+    Money entry_price{};
+    Money exit_price{};
+    Money realized_pnl{};
+    Money fees{};
+    Money spread_cost{};
+    CloseReason reason = CloseReason::Closed;
+    int64_t multiplier = 100;
+
+    int64_t holding_days() const { return opened_at.days_until(closed_at); }
+};
+
+// Account state at one instant. Realized and unrealized are carried separately so
+// a report can show what has actually been banked against what is still at risk.
+struct EquityPoint {
+    Timestamp timestamp{};
+    Money cash{};
+    Money realized_pnl{};
+    Money unrealized_pnl{};
+    Money equity{};
+    Money margin_requirement{};
+    Money position_value{};
+    int64_t open_positions = 0;
+};
+
 // Per-scenario results. Deterministic components are reported separately from
 // the stochastic spread cost so a reader can tell them apart.
 struct PathMetrics {
@@ -100,6 +143,11 @@ struct PathMetrics {
     int64_t assignment_count = 0;
     int64_t exercise_count = 0;
     int64_t expiration_count = 0;
+    int64_t trade_count = 0;
+    int64_t winning_trades = 0;
+    int64_t losing_trades = 0;
+    Money best_trade_pnl{};
+    Money worst_trade_pnl{};
     bool margin_breached = false;
     bool ledger_reconciles = true;
 };
@@ -150,6 +198,9 @@ public:
         metrics_.peak_equity = cfg_.initial_cash;
         equity_curve_.clear();
         next_order_id_ = 1;
+        next_trade_id_ = 1;
+        trades_.clear();
+        equity_points_.clear();
         applied_actions_.clear();
         current_ = MarketSnapshot{};
         day_start_equity_ = cfg_.initial_cash;
@@ -193,12 +244,36 @@ public:
         }
     }
 
-    // Steps 7-9: settle expirations, revalue, enforce risk, record the path.
+    // Steps 7-9: settle anything already past expiration, revalue, enforce risk,
+    // record the path.
     void end_bar() {
-        process_expirations();
+        process_expirations_through(now_);
         const AccountState state = account_state();
         enforce_risk(state);
         record_equity(state);
+    }
+
+    // Closes a trading session at `session_close`, settling every position whose
+    // expiration falls on or before it.
+    //
+    // This exists because expiration is an instant no bar occupies. Contracts
+    // expire at the 16:00 ET close, while minute bars are stamped at minute
+    // start, so the last bar of the day is 15:59 and `expiration <= now_` is never
+    // satisfied on the expiration date. Settling on bar timestamps alone therefore
+    // deferred every expiration to the *next* session's open, injecting an
+    // overnight or weekend gap into the settlement price of every expiring
+    // position -- measured at one point as -$1,500 where the correct answer was
+    // +$1,800.
+    //
+    // The last observed spot of the session is used, which is the closing price a
+    // real settlement would reference.
+    void end_session(Timestamp session_close) {
+        process_expirations_through(session_close);
+        const AccountState state = account_state();
+        enforce_risk(state);
+        // Reset the daily loss baseline so max_daily_loss is genuinely daily
+        // rather than a cumulative loss from initial cash.
+        day_start_equity_ = state.equity;
     }
 
     AccountState account_state() const {
@@ -218,6 +293,8 @@ public:
     const std::vector<Fill>& fills() const { return fills_; }
     const std::vector<OrderRejection>& rejections() const { return rejections_; }
     const std::vector<Money>& equity_curve() const { return equity_curve_; }
+    const std::vector<EquityPoint>& equity_points() const { return equity_points_; }
+    const std::vector<TradeRecord>& trades() const { return trades_; }
     const Ledger& ledger() const { return ledger_; }
     const PositionBook& positions() const { return book_; }
     const BacktestConfig& config() const { return cfg_; }
@@ -470,9 +547,29 @@ private:
         for (const Planned& p : plan) {
             const int64_t signed_qty = (p.order.side == OrderSide::Buy) ? p.order.quantity
                                                                         : -p.order.quantity;
-            book_.apply(p.order.contract_version_id, EquityKind::Option, signed_qty,
-                        p.fill_price, p.multiplier, now_);
+            // Capture the pre-trade state so a close can be recorded with the
+            // entry price it is closing against.
+            const Position* existing = book_.find(p.order.contract_version_id);
+            const Money prior_avg = existing ? existing->average_cost() : Money::zero();
+            const Timestamp opened_at = existing ? existing->opened_at : now_;
+            const bool was_short = existing && existing->quantity < 0;
+
+            const ApplyFillResult applied = book_.apply(
+                p.order.contract_version_id, EquityKind::Option, signed_qty,
+                p.fill_price, p.multiplier, now_);
             book_.add_fees(p.order.contract_version_id, p.fees);
+
+            if (applied.closed_quantity > 0) {
+                record_trade(TradeRecord{
+                    next_trade_id_++, p.order.contract_version_id,
+                    /*open_group_id=*/0, group.group_id, opened_at, now_,
+                    applied.closed_quantity, was_short,
+                    Money{prior_avg.micros / p.multiplier}, p.fill_price,
+                    applied.realized_pnl, p.fees,
+                    Money{p.half_spread.micros * applied.closed_quantity * p.multiplier},
+                    CloseReason::Closed, p.multiplier,
+                });
+            }
 
             ledger_.post(now_, LedgerEntryKind::OptionPremium, p.gross_cash,
                          p.order.contract_version_id, p.order.order_id, "option premium");
@@ -623,13 +720,13 @@ private:
     // -----------------------------------------------------------------------
     // Expiration and settlement
     // -----------------------------------------------------------------------
-    void process_expirations() {
+    void process_expirations_through(Timestamp cutoff) {
         if (cfg_.assignment_policy == AssignmentPolicy::ExplicitExerciseOnly) return;
 
         for (const Position& p : book_.snapshot()) {
             if (p.kind != EquityKind::Option || p.quantity == 0) continue;
             const OptionContractVersion* c = registry_.find(p.contract_version_id);
-            if (c == nullptr || c->expiration > now_) continue;
+            if (c == nullptr || c->expiration > cutoff) continue;
 
             const Money spot = underlying_of(c->underlying_symbol);
             const Money intrinsic = (c->type == OptionType::Call)
@@ -640,10 +737,27 @@ private:
                 cfg_.assignment_policy != AssignmentPolicy::ExpirationOnly
                 && intrinsic >= automatic_exercise_threshold();
 
+            const Money entry_avg = p.average_cost();
+            const bool was_short = p.quantity < 0;
+            const int64_t closed = p.abs_quantity();
+
             // Remove the option at zero, realizing the full remaining basis.
-            book_.apply(p.contract_version_id, EquityKind::Option, -p.quantity,
-                        Money::zero(), c->quote_multiplier, now_);
+            const ApplyFillResult applied = book_.apply(
+                p.contract_version_id, EquityKind::Option, -p.quantity,
+                Money::zero(), c->quote_multiplier, now_);
             metrics_.expiration_count++;
+
+            const CloseReason reason = !exercise ? CloseReason::Expired
+                : (p.quantity > 0 ? CloseReason::Exercised : CloseReason::Assigned);
+            record_trade(TradeRecord{
+                next_trade_id_++, p.contract_version_id, 0, 0,
+                p.opened_at, now_, closed, was_short,
+                Money{entry_avg.micros / c->quote_multiplier},
+                // An expiring option is closed at zero; the intrinsic it settles
+                // into shows up in the settlement cash flow, not here.
+                Money::zero(), applied.realized_pnl, Money::zero(), Money::zero(),
+                reason, c->quote_multiplier,
+            });
 
             if (!exercise) continue;
 
@@ -715,8 +829,21 @@ private:
             halted_ = true;
     }
 
+    void record_trade(TradeRecord t) {
+        if (t.realized_pnl > metrics_.best_trade_pnl) metrics_.best_trade_pnl = t.realized_pnl;
+        if (t.realized_pnl < metrics_.worst_trade_pnl) metrics_.worst_trade_pnl = t.realized_pnl;
+        metrics_.trade_count++;
+        if (t.realized_pnl > Money::zero()) metrics_.winning_trades++;
+        else if (t.realized_pnl < Money::zero()) metrics_.losing_trades++;
+        trades_.push_back(std::move(t));
+    }
+
     void record_equity(const AccountState& s) {
         equity_curve_.push_back(s.equity);
+        equity_points_.push_back(EquityPoint{
+            now_, s.cash, s.realized_pnl, s.unrealized_pnl, s.equity,
+            s.margin_requirement, position_market_value(), s.open_position_count,
+        });
         for (const MarketBar& b : current_.bars)
             last_mark_[b.contract_version_id.value] =
                 b.valuation_price.is_zero() ? b.close : b.valuation_price;
@@ -742,10 +869,13 @@ private:
     std::unordered_map<std::string, Money> last_underlying_;
 
     std::vector<Money> equity_curve_;
+    std::vector<EquityPoint> equity_points_;
+    std::vector<TradeRecord> trades_;
     PathMetrics metrics_;
     Timestamp now_{};
     uint32_t scenario_id_ = 0;
     uint64_t next_order_id_ = 1;
+    uint64_t next_trade_id_ = 1;
     Money day_start_equity_{};
     bool halted_ = false;
 };

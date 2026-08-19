@@ -332,6 +332,10 @@ PYBIND11_MODULE(obt_engine, m) {
         .def_readwrite("proportional_bps", &SpreadModelConfig::proportional_bps)
         .def_readwrite("log_base", &SpreadModelConfig::log_base)
         .def_readwrite("log_sigma", &SpreadModelConfig::log_sigma)
+        .def_readwrite("variance_scale", &SpreadModelConfig::variance_scale)
+        .def_readwrite("preserve_mean_under_variance_scale",
+                       &SpreadModelConfig::preserve_mean_under_variance_scale)
+        .def("effective_sigma", &SpreadModelConfig::effective_sigma)
         .def_readwrite("beta_iv", &SpreadModelConfig::beta_iv)
         .def_readwrite("beta_log_dte", &SpreadModelConfig::beta_log_dte)
         .def_readwrite("beta_log_volume", &SpreadModelConfig::beta_log_volume)
@@ -439,8 +443,51 @@ PYBIND11_MODULE(obt_engine, m) {
         .def_readonly("assignment_count", &PathMetrics::assignment_count)
         .def_readonly("exercise_count", &PathMetrics::exercise_count)
         .def_readonly("expiration_count", &PathMetrics::expiration_count)
+        .def_readonly("trade_count", &PathMetrics::trade_count)
+        .def_readonly("winning_trades", &PathMetrics::winning_trades)
+        .def_readonly("losing_trades", &PathMetrics::losing_trades)
+        .def_property_readonly("best_trade_pnl", [](const PathMetrics& p) { return p.best_trade_pnl.to_double(); })
+        .def_property_readonly("worst_trade_pnl", [](const PathMetrics& p) { return p.worst_trade_pnl.to_double(); })
         .def_readonly("margin_breached", &PathMetrics::margin_breached)
         .def_readonly("ledger_reconciles", &PathMetrics::ledger_reconciles);
+
+    py::enum_<CloseReason>(m, "CloseReason")
+        .value("CLOSED", CloseReason::Closed)
+        .value("EXPIRED", CloseReason::Expired)
+        .value("EXERCISED", CloseReason::Exercised)
+        .value("ASSIGNED", CloseReason::Assigned)
+        .value("ADJUSTED", CloseReason::Adjusted);
+
+    py::class_<TradeRecord>(m, "TradeRecord")
+        .def_readonly("trade_id", &TradeRecord::trade_id)
+        .def_property_readonly("contract_version_id",
+            [](const TradeRecord& t) { return t.contract_version_id.value; })
+        .def_readonly("close_group_id", &TradeRecord::close_group_id)
+        .def_property_readonly("opened_at", [](const TradeRecord& t) { return t.opened_at.epoch_ns; })
+        .def_property_readonly("closed_at", [](const TradeRecord& t) { return t.closed_at.epoch_ns; })
+        .def_readonly("quantity", &TradeRecord::quantity)
+        .def_readonly("was_short", &TradeRecord::was_short)
+        .def_property_readonly("entry_price", [](const TradeRecord& t) { return t.entry_price.to_double(); })
+        .def_property_readonly("exit_price", [](const TradeRecord& t) { return t.exit_price.to_double(); })
+        .def_property_readonly("realized_pnl", [](const TradeRecord& t) { return t.realized_pnl.to_double(); })
+        .def_property_readonly("realized_pnl_micros", [](const TradeRecord& t) { return t.realized_pnl.micros; })
+        .def_property_readonly("fees", [](const TradeRecord& t) { return t.fees.to_double(); })
+        .def_property_readonly("spread_cost", [](const TradeRecord& t) { return t.spread_cost.to_double(); })
+        .def_readonly("reason", &TradeRecord::reason)
+        .def_readonly("multiplier", &TradeRecord::multiplier)
+        .def_property_readonly("holding_days", &TradeRecord::holding_days);
+
+    py::class_<EquityPoint>(m, "EquityPoint")
+        .def_property_readonly("timestamp", [](const EquityPoint& e) { return e.timestamp.epoch_ns; })
+        .def_property_readonly("cash", [](const EquityPoint& e) { return e.cash.to_double(); })
+        .def_property_readonly("realized_pnl", [](const EquityPoint& e) { return e.realized_pnl.to_double(); })
+        .def_property_readonly("unrealized_pnl", [](const EquityPoint& e) { return e.unrealized_pnl.to_double(); })
+        .def_property_readonly("equity", [](const EquityPoint& e) { return e.equity.to_double(); })
+        .def_property_readonly("equity_micros", [](const EquityPoint& e) { return e.equity.micros; })
+        .def_property_readonly("margin_requirement",
+            [](const EquityPoint& e) { return e.margin_requirement.to_double(); })
+        .def_property_readonly("position_value", [](const EquityPoint& e) { return e.position_value.to_double(); })
+        .def_readonly("open_positions", &EquityPoint::open_positions);
 
     py::class_<AccountState>(m, "AccountState")
         .def_property_readonly("cash", [](const AccountState& s) { return s.cash.to_double(); })
@@ -524,6 +571,12 @@ PYBIND11_MODULE(obt_engine, m) {
         .def("begin_bar", &Engine::begin_bar, py::arg("snapshot"))
         .def("submit_group", &Engine::submit_group, py::arg("group"))
         .def("end_bar", &Engine::end_bar)
+        // Takes epoch nanoseconds, matching every other timestamp on this API.
+        .def("end_session",
+             [](Engine& e, int64_t session_close_ns) {
+                 e.end_session(Timestamp{session_close_ns});
+             },
+             py::arg("session_close_ns"))
         .def("finalize", &Engine::finalize)
         .def("account_state", &Engine::account_state)
         .def("metrics", &Engine::metrics, py::return_value_policy::copy)
@@ -536,6 +589,8 @@ PYBIND11_MODULE(obt_engine, m) {
             for (Money m : e.equity_curve()) out.push_back(m.to_double());
             return out;
         })
+        .def("trades", &Engine::trades, py::return_value_policy::copy)
+        .def("equity_points", &Engine::equity_points, py::return_value_policy::copy)
         .def("ledger_entries", [](const Engine& e) { return e.ledger().entries(); })
         .def("ledger_reconciles", [](const Engine& e) { return e.ledger().reconciles(); })
         .def("cash", [](const Engine& e) { return e.ledger().cash().to_double(); })
