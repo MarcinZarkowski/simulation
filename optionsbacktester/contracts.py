@@ -63,7 +63,17 @@ def build_contracts(options: pl.DataFrame, underlying_symbol: str) -> dict[int, 
         "is_adjusted_contract", "adjusted_pricing_status",
     ]
     present = [c for c in wanted if c in options.columns]
-    unique_terms = options.select(present).unique(subset=["symbol"], keep="first")
+
+    # Deduplicate on the terms that define a version, not on the symbol. The same
+    # OCC symbol either side of an adjustment describes different economics, and
+    # collapsing those onto one version is exactly what contract_version_key
+    # exists to prevent: build_bars derives the key from each row's own terms, so
+    # a dropped variant's bars would silently fail to match and disappear.
+    version_columns = [
+        c for c in ("symbol", "strike", "deliverable_equity_amount", "quote_multiplier")
+        if c in present
+    ]
+    unique_terms = options.select(present).unique(subset=version_columns, keep="first")
 
     out: dict[int, E.OptionContractVersion] = {}
     for row in unique_terms.iter_rows(named=True):
