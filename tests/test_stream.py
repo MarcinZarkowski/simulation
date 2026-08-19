@@ -11,6 +11,7 @@ import pytest
 
 from optionsbacktester.contracts import (
     build_contracts,
+    build_dividends,
     build_snapshot,
     contract_version_key,
     to_ns,
@@ -520,6 +521,60 @@ class TestContractMapping:
         contracts = build_contracts(pl.concat([row, adjusted]), TICKER)
 
         assert len(contracts) == 2
+
+
+class TestDividendMapping:
+    """``corporate_actions.parquet`` was loaded into DaySlice and never read."""
+
+    def _frame(self, **overrides):
+        row = {
+            "date": date(2024, 3, 1),
+            "type": "dividend",
+            "ticker": TICKER,
+            "amount": 0.75,
+            "declared_date": date(2024, 2, 1),
+            "pay_date": date(2024, 3, 20),
+            "source_available_at": datetime(2024, 2, 2, 12, 0),
+        }
+        row.update(overrides)
+        return pl.DataFrame([row])
+
+    def test_the_three_dates_and_the_amount_are_carried_through(self):
+        d = build_dividends(self._frame(), TICKER)[0]
+
+        assert d.underlying_symbol == TICKER
+        assert d.amount_per_share == pytest.approx(0.75)
+        assert d.ex_date == to_ns(date(2024, 3, 1))
+        assert d.pay_date == to_ns(date(2024, 3, 20))
+
+    def test_declared_at_takes_the_later_of_declaration_and_availability(self):
+        """
+        Either alone lets a backtest anticipate the announcement: the declaration
+        because the vendor had not published it yet, availability because a vendor
+        backfill can predate the announcement it describes.
+        """
+        later_source = build_dividends(self._frame(), TICKER)[0]
+        assert later_source.declared_at == to_ns(datetime(2024, 2, 2, 12, 0))
+
+        later_declaration = build_dividends(
+            self._frame(source_available_at=datetime(2024, 1, 1)), TICKER)[0]
+        assert later_declaration.declared_at == to_ns(date(2024, 2, 1))
+
+    def test_a_missing_pay_date_falls_back_to_the_ex_date(self):
+        d = build_dividends(self._frame(pay_date=None), TICKER)[0]
+
+        assert d.pay_date == d.ex_date == to_ns(date(2024, 3, 1))
+
+    @pytest.mark.parametrize("overrides", [
+        pytest.param({"type": "split", "ratio": 2.0}, id="a_split_is_not_a_dividend"),
+        pytest.param({"amount": None}, id="no_amount"),
+        pytest.param({"date": None}, id="no_ex_date"),
+    ])
+    def test_rows_that_are_not_payable_dividends_are_skipped(self, overrides):
+        assert build_dividends(self._frame(**overrides), TICKER) == []
+
+    def test_an_empty_frame_is_not_an_error(self):
+        assert build_dividends(pl.DataFrame(), TICKER) == []
 
 
 def test_iter_days_is_a_generator_so_memory_stays_flat_over_a_long_run(tmp_lake):

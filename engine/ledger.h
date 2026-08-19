@@ -96,6 +96,7 @@ enum class LedgerEntryKind : uint8_t {
     ExpirationSettlement,
     CashSettlement,
     CorporateActionCash,
+    DividendCash,
 };
 
 // Append-only journal. Every cash movement is recorded, so the closing balance

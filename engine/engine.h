@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "contract.h"
+#include "dividend.h"
 #include "ledger.h"
 #include "margin.h"
 #include "order.h"
@@ -29,8 +30,11 @@ enum class AssignmentPolicy : uint8_t {
     // OCC exercise-by-exception: anything at least one cent in the money at
     // expiration is exercised. This is the research default.
     AutomaticITMExercise,
-    // Additionally assigns short options early when a strategy would rationally
-    // be assigned, currently limited to the observable dividend case.
+    // Additionally assigns a short call the session before an ex-dividend date
+    // when the holder would rationally exercise to capture the dividend. This was
+    // declared and never implemented: it behaved byte-for-byte like
+    // AutomaticITMExercise, so a covered call or a poor man's covered call kept a
+    // short leg the market would have taken away.
     ConservativeEarlyAssignment,
 };
 
@@ -171,6 +175,9 @@ struct PathMetrics {
     // presenting the number plainly.
     bool truncated = false;
     int64_t quarantined_positions = 0;
+    int64_t early_assignment_count = 0;
+    // Net dividend cash: received on long shares, owed on short.
+    Money dividend_cash{};
 };
 
 // What a strategy is allowed to see at time T. Built from data already
@@ -222,6 +229,16 @@ public:
     // Appends. Replacing silently dropped any transition whose effective date
     // fell later than the next day carrying a lineage row, so a split queued on
     // day 1 for day 10 never happened if day 2 also had lineage data.
+    // Cash dividends on the underlying. Queued as the pipeline discovers them;
+    // each is applied once, keyed on its terms, so re-queueing the same row on
+    // consecutive days is harmless.
+    void queue_dividends(const std::vector<DividendEvent>& events) {
+        for (const DividendEvent& d : events) {
+            if (queued_dividend_ids_.insert(d.event_id()).second)
+                dividends_.push_back(d);
+        }
+    }
+
     void queue_corporate_actions(std::vector<CorporateActionTransition> events) {
         for (CorporateActionTransition& t : events) {
             if (queued_event_ids_.insert(t.lineage_event_id).second)
@@ -246,6 +263,13 @@ public:
         equity_points_.clear();
         applied_actions_.clear();
         superseded_versions_.clear();
+        // Queued dividends survive a scenario reset -- they are market data, and
+        // every Monte Carlo path sees the same ones -- but anything derived from
+        // one path's positions must not leak into the next.
+        applied_dividend_ids_.clear();
+        accruals_.clear();
+        prior_close_mark_.clear();
+        prior_close_spot_.clear();
         current_ = MarketSnapshot{};
         day_start_equity_ = cfg_.initial_cash;
         halted_ = false;
@@ -259,6 +283,7 @@ public:
 
         apply_due_corporate_actions();
         index_current_bars();
+        process_dividends();
         fill_pending_orders();
     }
 
@@ -313,6 +338,7 @@ public:
     // real settlement would reference.
     void end_session(Timestamp session_close) {
         process_expirations_through(session_close);
+        capture_session_close();
         const AccountState state = account_state();
         enforce_risk(state);
         // Reset the daily loss baseline so max_daily_loss is genuinely daily
@@ -1017,6 +1043,114 @@ private:
         }
     }
 
+
+    // -----------------------------------------------------------------------
+    // Dividends and early assignment
+    // -----------------------------------------------------------------------
+    // The last observed mark and spot of the previous session. The ex-date
+    // decision has to be made on pre-drop data: the underlying opens ex-date
+    // lower by roughly the dividend, so measuring a call's extrinsic value at
+    // the ex-date open understates it and would assign calls that no rational
+    // holder would exercise.
+    void capture_session_close() {
+        for (const auto& [cv, bar] : bar_index_)
+            prior_close_mark_[cv] = bar->valuation_price.is_zero() ? bar->close
+                                                                  : bar->valuation_price;
+        for (const auto& [symbol, price] : current_.underlying_price)
+            prior_close_spot_[symbol] = price;
+    }
+
+    // Dividends whose ex-date this bar has reached: assign short calls the holder
+    // would rationally exercise, then accrue on whatever shares remain. Then pay
+    // anything that has reached its pay date.
+    void process_dividends() {
+        for (DividendEvent& d : dividends_) {
+            if (applied_dividend_ids_.count(d.event_id())) continue;
+            if (d.ex_date > now_) continue;
+            // An undeclared dividend is not knowable. Applying it anyway would let
+            // a strategy accrue cash from an announcement that had not happened.
+            if (!d.known_at(now_)) continue;
+
+            applied_dividend_ids_.insert(d.event_id());
+            if (cfg_.assignment_policy == AssignmentPolicy::ConservativeEarlyAssignment)
+                assign_calls_before_ex_dividend(d);
+            accrue_dividend(d);
+        }
+        pay_due_dividends();
+    }
+
+    // A call holder exercises early to capture a dividend when the dividend
+    // exceeds what they give up by exercising, which is the call's extrinsic
+    // value. Below that, holding is worth more than the dividend and no rational
+    // holder exercises.
+    //
+    // Evaluated in aggregate rather than per share so an adjusted contract with a
+    // non-standard deliverable is handled by the same expression.
+    void assign_calls_before_ex_dividend(const DividendEvent& d) {
+        for (const Position& p : book_.snapshot()) {
+            if (p.kind != EquityKind::Option || p.quantity >= 0) continue;
+            const OptionContractVersion* c = registry().find(p.contract_version_id);
+            if (c == nullptr || c->type != OptionType::Call) continue;
+            if (c->underlying_symbol != d.underlying_symbol) continue;
+            // Expiring anyway: the expiration path handles it, with the correct
+            // reason and the correct threshold.
+            if (c->expiration <= now_) continue;
+
+            auto spot_it = prior_close_spot_.find(c->underlying_symbol);
+            auto mark_it = prior_close_mark_.find(p.contract_version_id.value);
+            if (spot_it == prior_close_spot_.end() || mark_it == prior_close_mark_.end())
+                continue;
+
+            const Money intrinsic = c->payoff_at(spot_it->second);
+            if (intrinsic.is_zero()) continue;
+            const Money aggregate_mark = Money{mark_it->second.micros * c->quote_multiplier};
+            const Money extrinsic = aggregate_mark - intrinsic;
+            const Money dividend =
+                Money{d.amount_per_share.micros * c->deliverable_shares_per_contract()};
+            if (extrinsic >= dividend) continue;
+
+            const int64_t assigned = p.abs_quantity();
+            const Money entry_avg = p.average_cost();
+            const ApplyFillResult applied = book_.apply(
+                p.contract_version_id, EquityKind::Option, assigned,
+                Money::zero(), c->quote_multiplier, now_);
+            record_trade(TradeRecord{
+                next_trade_id_++, p.contract_version_id, 0, 0,
+                p.opened_at, now_, assigned, true,
+                Money{entry_avg.micros / c->quote_multiplier},
+                Money::zero(), applied.realized_pnl, Money::zero(), Money::zero(),
+                CloseReason::Assigned, c->quote_multiplier,
+            });
+            settle_physically(*c, p.quantity, spot_it->second);
+            metrics_.assignment_count++;
+            metrics_.early_assignment_count++;
+        }
+    }
+
+    // Shares held into ex-date earn the dividend; shares held short owe it. The
+    // cash does not move until the pay date.
+    void accrue_dividend(const DividendEvent& d) {
+        const int64_t shares = book_.shares_of(d.underlying_symbol);
+        if (shares == 0) return;
+        accruals_.push_back(DividendAccrual{
+            d.underlying_symbol,
+            Money{d.amount_per_share.micros * shares},
+            shares, d.ex_date, d.pay_date,
+        });
+    }
+
+    void pay_due_dividends() {
+        auto it = accruals_.begin();
+        while (it != accruals_.end()) {
+            if (it->pay_date > now_) { ++it; continue; }
+            ledger_.post(now_, LedgerEntryKind::DividendCash, it->amount,
+                         ContractVersionId{}, 0,
+                         it->shares > 0 ? "dividend received" : "dividend owed on short shares");
+            metrics_.dividend_cash += it->amount;
+            it = accruals_.erase(it);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Risk and reporting
     // -----------------------------------------------------------------------
@@ -1082,6 +1216,12 @@ private:
     std::set<uint64_t> applied_actions_;
     std::set<uint64_t> queued_event_ids_;
     std::set<uint64_t> superseded_versions_;
+    std::vector<DividendEvent> dividends_;
+    std::vector<DividendAccrual> accruals_;
+    std::set<uint64_t> queued_dividend_ids_;
+    std::set<uint64_t> applied_dividend_ids_;
+    std::unordered_map<uint64_t, Money> prior_close_mark_;
+    std::unordered_map<std::string, Money> prior_close_spot_;
 
     MarketSnapshot current_;
     std::unordered_map<uint64_t, const MarketBar*> bar_index_;

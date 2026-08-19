@@ -26,12 +26,13 @@ import polars as pl
 import obt_engine as E
 
 from .contracts import (
+    build_contracts,
+    build_dividends,
     build_lineage_transitions,
     build_snapshot,
     contract_version_key,
     to_ns,
 )
-from .contracts import build_contracts
 from .stream import DataLake, DaySlice, UniverseFilter, iter_days, iter_timestamp_batches
 from .strategy import Chain, Context, Strategy, chain_from_batch
 
@@ -229,6 +230,11 @@ def run(
         contracts.update(new_contracts)
         for contract in new_contracts.values():
             registry.add(contract)
+
+        dividends = build_dividends(day.corporate_actions, ticker)
+        if dividends:
+            for engine in engines:
+                engine.queue_dividends(dividends)
 
         transitions = build_lineage_transitions(day.lineage_events, contracts)
         if transitions:

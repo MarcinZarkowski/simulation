@@ -470,7 +470,12 @@ PYBIND11_MODULE(obt_engine, m) {
         .def_readonly("margin_breached", &PathMetrics::margin_breached)
         .def_readonly("ledger_reconciles", &PathMetrics::ledger_reconciles)
         .def_readonly("truncated", &PathMetrics::truncated)
-        .def_readonly("quarantined_positions", &PathMetrics::quarantined_positions);
+        .def_readonly("quarantined_positions", &PathMetrics::quarantined_positions)
+        .def_readonly("early_assignment_count", &PathMetrics::early_assignment_count)
+        .def_property_readonly("dividend_cash",
+            [](const PathMetrics& m) { return m.dividend_cash.to_double(); })
+        .def_property_readonly("dividend_cash_micros",
+            [](const PathMetrics& m) { return m.dividend_cash.micros; });
 
     py::enum_<CloseReason>(m, "CloseReason")
         .value("CLOSED", CloseReason::Closed)
@@ -530,6 +535,23 @@ PYBIND11_MODULE(obt_engine, m) {
         .def("add", &ContractRegistry::add, py::arg("contract"))
         .def("size", &ContractRegistry::size);
 
+    py::class_<DividendEvent>(m, "DividendEvent")
+        .def(py::init<>())
+        .def_readwrite("underlying_symbol", &DividendEvent::underlying_symbol)
+        .def_property("amount_per_share",
+            [](const DividendEvent& d) { return d.amount_per_share.to_double(); },
+            [](DividendEvent& d, double v) { d.amount_per_share = Money::from_double(v); })
+        .def_property("declared_at",
+            [](const DividendEvent& d) { return d.declared_at.epoch_ns; },
+            [](DividendEvent& d, int64_t v) { d.declared_at = Timestamp{v}; })
+        .def_property("ex_date",
+            [](const DividendEvent& d) { return d.ex_date.epoch_ns; },
+            [](DividendEvent& d, int64_t v) { d.ex_date = Timestamp{v}; })
+        .def_property("pay_date",
+            [](const DividendEvent& d) { return d.pay_date.epoch_ns; },
+            [](DividendEvent& d, int64_t v) { d.pay_date = Timestamp{v}; })
+        .def_property_readonly("event_id", &DividendEvent::event_id);
+
     py::class_<MarketSnapshot>(m, "MarketSnapshot")
         .def(py::init<>())
         .def_property("timestamp",
@@ -579,7 +601,8 @@ PYBIND11_MODULE(obt_engine, m) {
         .value("ASSIGNMENT_SETTLEMENT", LedgerEntryKind::AssignmentSettlement)
         .value("EXPIRATION_SETTLEMENT", LedgerEntryKind::ExpirationSettlement)
         .value("CASH_SETTLEMENT", LedgerEntryKind::CashSettlement)
-        .value("CORPORATE_ACTION_CASH", LedgerEntryKind::CorporateActionCash);
+        .value("CORPORATE_ACTION_CASH", LedgerEntryKind::CorporateActionCash)
+        .value("DIVIDEND_CASH", LedgerEntryKind::DividendCash);
 
     // ---------------------------------------------------------------- engine
     py::class_<Engine>(m, "Engine")
@@ -604,6 +627,7 @@ PYBIND11_MODULE(obt_engine, m) {
         .def("share_registry", [](Engine& e, std::shared_ptr<ContractRegistry> r) {
             e.set_registry(std::move(r));
         }, py::arg("registry"))
+        .def("queue_dividends", &Engine::queue_dividends, py::arg("events"))
         .def("queue_corporate_actions", &Engine::queue_corporate_actions, py::arg("events"))
         .def("begin_scenario", &Engine::begin_scenario, py::arg("scenario_id"))
         .def("begin_bar", &Engine::begin_bar, py::arg("snapshot"))

@@ -8,7 +8,7 @@ through rather than reinterpreted.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 import polars as pl
 
@@ -17,8 +17,16 @@ import obt_engine as E
 NS_PER_SECOND = 1_000_000_000
 
 
-def to_ns(value: datetime) -> int:
-    """Epoch nanoseconds from a tz-naive UTC datetime, matching the lake."""
+def to_ns(value: datetime | date) -> int:
+    """
+    Epoch nanoseconds from a tz-naive UTC datetime, matching the lake.
+
+    Accepts a plain ``date`` too, at midnight: the corporate-actions frame stores
+    ex-dates and pay dates as dates, and midnight UTC precedes every session open,
+    so a dividend lands on the first bar of its ex-date.
+    """
+    if not isinstance(value, datetime):
+        value = datetime(value.year, value.month, value.day)
     if value.tzinfo is not None:
         value = value.replace(tzinfo=None)
     epoch = datetime(1970, 1, 1)
@@ -246,6 +254,48 @@ def build_snapshot(
             price = float(prices[0])
     snap.underlying_price = {underlying_symbol: price} if price is not None else {}
     return snap
+
+
+def build_dividends(
+    corporate_actions: pl.DataFrame,
+    underlying_symbol: str,
+) -> list[E.DividendEvent]:
+    """
+    Cash dividends from the pipeline's ``corporate_actions`` frame.
+
+    ``corporate_actions`` was loaded into ``DaySlice`` and never read, so a
+    dividend did three things it should not: it was never paid on a share
+    position, so a covered call understated its return by the whole yield; it
+    never triggered the early assignment a call holder would rationally take; and
+    the declaration date the pipeline gates on was ignored.
+
+    ``declared_at`` takes the later of the company's declaration and the moment the
+    source made it available. Either alone would let a backtest anticipate the
+    announcement -- the first because the vendor had not published it yet, the
+    second because a vendor backfill can predate the announcement it describes.
+    """
+    if corporate_actions.is_empty() or "type" not in corporate_actions.columns:
+        return []
+
+    rows = corporate_actions.filter(pl.col("type") == "dividend")
+    out: list[E.DividendEvent] = []
+    for row in rows.iter_rows(named=True):
+        amount = row.get("amount")
+        ex_date = row.get("date")
+        if not amount or not ex_date:
+            continue
+        d = E.DividendEvent()
+        d.underlying_symbol = underlying_symbol
+        d.amount_per_share = float(amount)
+        d.ex_date = to_ns(ex_date)
+        # Unstated pay date means same-day, which understates the float but never
+        # invents cash.
+        pay = row.get("pay_date")
+        d.pay_date = to_ns(pay) if pay else d.ex_date
+        declared = [to_ns(v) for v in (row.get("declared_date"), row.get("source_available_at")) if v]
+        d.declared_at = max(declared) if declared else d.ex_date
+        out.append(d)
+    return out
 
 
 def build_lineage_transitions(
