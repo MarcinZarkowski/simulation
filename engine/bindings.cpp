@@ -650,6 +650,91 @@ PYBIND11_MODULE(obt_engine, m) {
                 for (const auto& [k, v] : in) s.settlement_price[k] = money_from(v);
             });
 
+    // Every field that can change a number, as a flat dict. Exists so the run
+    // manifest's config hash cannot silently omit a setting: the previous hash
+    // covered only the manifest's own summary fields, so two runs with different
+    // spread calibrations, different risk limits, or different fail-closed gates
+    // reported the SAME config_sha256 and different results -- worse than no hash.
+    m.def("config_fingerprint", [](const BacktestConfig& c) {
+        py::dict out;
+        out["start_ns"] = c.start.epoch_ns;
+        out["end_ns"] = c.end.epoch_ns;
+        out["initial_cash_micros"] = c.initial_cash.micros;
+        out["execution_timing"] = static_cast<int>(c.execution_timing);
+        out["assignment_policy"] = static_cast<int>(c.assignment_policy);
+        out["margin_model"] = static_cast<int>(c.margin_model);
+        out["spread_mc_paths"] = c.spread_mc_paths;
+        out["spread_mc_seed"] = c.spread_mc_seed;
+        out["require_occ_confirmed_lineage"] = c.require_occ_confirmed_lineage;
+        out["reject_fallback_analytics"] = c.reject_fallback_analytics;
+        out["reject_stale_bars"] = c.reject_stale_bars;
+        out["require_point_in_time_terms"] = c.require_point_in_time_terms;
+        out["require_monotonic_time"] = c.require_monotonic_time;
+        out["mark_age_limit_ns"] = c.mark_age_limit_ns;
+
+        const SpreadModelConfig& s = c.spread_model;
+        py::dict spread;
+        spread["kind"] = static_cast<int>(s.kind);
+        spread["constant_cents"] = s.constant_cents;
+        spread["proportional_bps"] = s.proportional_bps;
+        spread["log_base"] = s.log_base;
+        spread["log_sigma"] = s.log_sigma;
+        spread["ref_implied_volatility"] = s.ref_implied_volatility;
+        spread["ref_days_to_expiry"] = s.ref_days_to_expiry;
+        spread["ref_volume"] = s.ref_volume;
+        spread["variance_scale"] = s.variance_scale;
+        spread["preserve_mean_under_variance_scale"] = s.preserve_mean_under_variance_scale;
+        spread["beta_iv"] = s.beta_iv;
+        spread["beta_log_dte"] = s.beta_log_dte;
+        spread["beta_log_volume"] = s.beta_log_volume;
+        spread["beta_abs_moneyness"] = s.beta_abs_moneyness;
+        spread["beta_minutes_from_open"] = s.beta_minutes_from_open;
+        spread["min_half_spread_cents"] = s.min_half_spread_cents;
+        spread["max_fraction_of_mark"] = s.max_fraction_of_mark;
+        spread["round_to_tick"] = s.round_to_tick;
+        spread["equity_full_spread_bps"] = s.equity_full_spread_bps;
+        spread["equity_log_sigma"] = s.equity_log_sigma;
+        spread["equity_min_half_spread_cents"] = s.equity_min_half_spread_cents;
+        spread["empirical_half_spread_cents"] = s.empirical_half_spread_cents;
+        out["spread_model"] = spread;
+
+        const FeeSchedule& f = c.fees;
+        py::dict fees;
+        fees["schedule_id"] = f.schedule_id;
+        // The rates themselves, not only the label. A schedule_id is a name, and
+        // changing a rate without renaming it must change the hash.
+        fees["commission_per_contract"] = f.commission_per_contract.micros;
+        fees["commission_per_trade"] = f.commission_per_trade.micros;
+        fees["sec_fee_rate_per_dollar"] = f.sec_fee_rate_per_dollar;
+        fees["sec_fee_on_sells_only"] = f.sec_fee_on_sells_only;
+        fees["finra_taf_per_contract"] = f.finra_taf_per_contract.micros;
+        fees["finra_taf_cap_per_trade"] = f.finra_taf_cap_per_trade.micros;
+        fees["regulatory_per_contract"] = f.regulatory_per_contract.micros;
+        fees["cat_per_contract"] = f.cat_per_contract.micros;
+        fees["exercise_fee"] = f.exercise_fee.micros;
+        fees["assignment_fee"] = f.assignment_fee.micros;
+        fees["equity_commission_per_share"] = f.equity_commission_per_share.micros;
+        fees["equity_commission_per_trade"] = f.equity_commission_per_trade.micros;
+        fees["finra_taf_per_share"] = f.finra_taf_per_share.micros;
+        fees["finra_taf_min_shares"] = f.finra_taf_min_shares;
+        fees["sec_fee_min_sale_notional"] = f.sec_fee_min_sale_notional.micros;
+        out["fees"] = fees;
+
+        const RiskLimits& r = c.risk;
+        py::dict risk;
+        risk["max_open_positions"] = r.max_open_positions;
+        risk["max_contracts_per_underlying"] = r.max_contracts_per_underlying;
+        risk["max_notional_per_underlying"] = r.max_notional_per_underlying.micros;
+        risk["max_loss_per_trade"] = r.max_loss_per_trade.micros;
+        risk["max_daily_loss"] = r.max_daily_loss.micros;
+        risk["max_drawdown_fraction"] = r.max_drawdown_fraction;
+        risk["max_margin_usage_fraction"] = r.max_margin_usage_fraction;
+        risk["max_short_option_contracts"] = r.max_short_option_contracts;
+        risk["max_abs_delta"] = r.max_abs_delta;
+        out["risk"] = risk;
+        return out;
+    }, py::arg("config"));
+
     py::class_<SpreadPairing>(m, "SpreadPairing")
         .def_property_readonly("short_leg", [](const SpreadPairing& p) { return p.short_leg.value; })
         .def_property_readonly("long_leg", [](const SpreadPairing& p) { return p.long_leg.value; })

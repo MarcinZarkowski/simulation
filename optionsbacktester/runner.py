@@ -76,6 +76,15 @@ class RunManifest:
     bar_count: int = 0
     option_row_count: int = 0
     config_sha256: str = ""
+    # Everything that can change a number and is not already a manifest field:
+    # the full engine config, the universe filter, and the strategy's parameters.
+    # Kept alongside the hash so a mismatch can be diagnosed rather than only
+    # detected.
+    config_detail: dict = field(default_factory=dict)
+    # SHA-256 of the compiled extension. The engine's behaviour lives in the
+    # binary, so a rebuilt engine is a different experiment even at an identical
+    # config, and nothing else in the manifest would show it.
+    engine_sha256: str = ""
     platform: str = field(default_factory=lambda: f"{platform.system()}-{platform.machine()}")
 
     def to_dict(self) -> dict:
@@ -84,7 +93,7 @@ class RunManifest:
     def finalize(self) -> RunManifest:
         payload = json.dumps(
             {k: v for k, v in self.to_dict().items() if k != "config_sha256"},
-            sort_keys=True,
+            sort_keys=True, default=str,
         )
         self.config_sha256 = hashlib.sha256(payload.encode()).hexdigest()
         return self
@@ -144,6 +153,52 @@ def _hash_files(paths: list[Path]) -> str:
         except OSError:
             digest.update(b"<unreadable>")
     return digest.hexdigest()
+
+
+def _engine_sha256() -> str:
+    """
+    Hash of the compiled extension.
+
+    The engine's behaviour lives in the binary, so a rebuild is a different
+    experiment even at an identical config. Empty rather than raising if the module
+    has no file on disk, since that is a packaging question and not a run failure.
+    """
+    origin = getattr(E, "__file__", None)
+    if not origin:
+        return ""
+    try:
+        return hashlib.sha256(Path(origin).read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _strategy_parameters(strategy: Strategy) -> dict:
+    """
+    A strategy's own settings, which no engine config can capture.
+
+    Two runs of the same strategy CLASS with different deltas or tenors are
+    different experiments. Read from a `parameters` property when the strategy
+    provides one -- there is no way to introspect arbitrary instance state
+    meaningfully, so this is opt-in and its absence is recorded as such rather than
+    silently treated as "no parameters".
+
+    Reads an instance the run already built. Constructing a probe instead would be a
+    visible side effect: a factory that counts its calls would see an extra one.
+    """
+    declared = getattr(strategy, "parameters", None)
+    if declared is None:
+        return {"available": False,
+                "reason": "strategy declares no `parameters`; its settings are not hashed"}
+    try:
+        return {"available": True, "values": dict(declared)}
+    except (TypeError, ValueError):
+        return {"available": False, "reason": "`parameters` is not a mapping"}
+
+
+def _universe_fingerprint(universe: UniverseFilter | None) -> dict:
+    if universe is None:
+        return {"filtered": False}
+    return {"filtered": True, **{k: v for k, v in vars(universe).items()}}
 
 
 def _spread_model_name(cfg: E.SpreadModelConfig) -> str:
@@ -271,6 +326,13 @@ def run(
         margin_model=str(config.margin_model).rsplit(".", 1)[-1].lower(),
         bar_count=bar_count,
         option_row_count=option_row_count,
+        engine_sha256=_engine_sha256(),
+        config_detail={
+            "engine_config": E.config_fingerprint(config),
+            "universe": _universe_fingerprint(universe),
+            "strategy": _strategy_parameters(strategies[0]),
+            "require_complete_days": require_complete_days,
+        },
         fee_schedule=config.fees.schedule_id,
         initial_cash=config.initial_cash,
         data_sha256=_hash_files(files_read) if hash_data else "",
