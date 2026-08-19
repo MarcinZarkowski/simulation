@@ -62,9 +62,9 @@ class PositionBook {
 public:
     // Applies a signed quantity change at a given per-contract price.
     //
-    // Closing uses average cost so a partial close realizes a proportional
-    // share of the basis. This is what makes repeated open/close cycles sum
-    // exactly to the difference between cash in and cash out.
+    // A partial close releases a proportional share of the basis, so repeated
+    // open and close cycles sum exactly to the difference between cash in and
+    // cash out -- including when the position was built at several prices.
     ApplyFillResult apply(
         ContractVersionId cv, EquityKind kind, int64_t signed_qty,
         Money price_per_unit, int64_t multiplier, Timestamp at)
@@ -86,9 +86,14 @@ public:
         if (opposing) {
             const int64_t closable = std::min(p.abs_quantity(),
                                               signed_qty < 0 ? -signed_qty : signed_qty);
-            const Money avg = p.average_cost();
-            // Basis released by closing `closable` units.
-            const Money released = Money{avg.micros * (p.quantity > 0 ? closable : -closable)};
+            // Release basis with ONE exact division rather than truncating an
+            // average and then multiplying it back up. Truncating first amplified
+            // the error by the closed quantity, so realized P&L drifted from the
+            // cash it produced -- about a microdollar per partial close, and only
+            // once a position was built at more than one price, which is why
+            // single-price tests never saw it. Dividing once leaves the remainder
+            // in cost_basis, where the final close releases it exactly.
+            const Money released = Money{p.cost_basis.micros * closable / p.abs_quantity()};
             // Proceeds of the closing trade, signed against the position.
             const Money proceeds = Money{unit_value.micros * (p.quantity > 0 ? closable : -closable)};
 
@@ -165,12 +170,12 @@ public:
         e.symbol = symbol;
         const bool opposing = (e.shares > 0 && signed_shares < 0) || (e.shares < 0 && signed_shares > 0);
         if (opposing) {
+            const int64_t held = e.shares < 0 ? -e.shares : e.shares;
             const int64_t closable = std::min(
-                e.shares < 0 ? -e.shares : e.shares,
-                signed_shares < 0 ? -signed_shares : signed_shares);
-            const Money avg = e.average_cost();
+                held, signed_shares < 0 ? -signed_shares : signed_shares);
             const int64_t dir = e.shares > 0 ? 1 : -1;
-            const Money released = Money{avg.micros * dir * closable};
+            // Same single-division release as the option path.
+            const Money released = Money{e.cost_basis.micros * closable / held};
             const Money proceeds = Money{price.micros * dir * closable};
             e.realized_pnl += proceeds - released;
             e.cost_basis -= released;
