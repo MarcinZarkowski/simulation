@@ -1,0 +1,726 @@
+#pragma once
+
+#include <cmath>
+#include <memory>
+#include <set>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "contract.h"
+#include "ledger.h"
+#include "margin.h"
+#include "order.h"
+#include "position.h"
+#include "spread.h"
+#include "types.h"
+
+namespace obt {
+
+// How options that finish in the money are resolved. Exercise and assignment
+// are deterministic policies, never Monte Carlo: randomizing them would mix an
+// unobservable into results that are otherwise reproducible.
+enum class AssignmentPolicy : uint8_t {
+    // Options simply expire; nothing is exercised. Useful for isolating
+    // pure premium capture.
+    ExpirationOnly,
+    // Only a strategy's explicit exercise order does anything.
+    ExplicitExerciseOnly,
+    // OCC exercise-by-exception: anything at least one cent in the money at
+    // expiration is exercised. This is the research default.
+    AutomaticITMExercise,
+    // Additionally assigns short options early when a strategy would rationally
+    // be assigned, currently limited to the observable dividend case.
+    ConservativeEarlyAssignment,
+};
+
+// OCC exercise-by-exception threshold: one cent in the money.
+inline Money automatic_exercise_threshold() { return Money::from_double(0.01); }
+
+struct RiskLimits {
+    int64_t max_open_positions = 0;          // 0 disables the limit
+    int64_t max_contracts_per_underlying = 0;
+    Money max_notional_per_underlying{};
+    Money max_loss_per_trade{};
+    Money max_daily_loss{};
+    double max_drawdown_fraction = 0.0;
+    double max_margin_usage_fraction = 0.0;
+    int64_t max_short_option_contracts = 0;
+    double max_abs_delta = 0.0;
+
+    bool any_enabled() const {
+        return max_open_positions || max_contracts_per_underlying
+            || !max_notional_per_underlying.is_zero() || !max_loss_per_trade.is_zero()
+            || !max_daily_loss.is_zero() || max_drawdown_fraction > 0.0
+            || max_margin_usage_fraction > 0.0 || max_short_option_contracts
+            || max_abs_delta > 0.0;
+    }
+};
+
+struct BacktestConfig {
+    Timestamp start{};
+    Timestamp end = Timestamp::never();
+    Money initial_cash = Money::from_double(100'000.0);
+
+    ExecutionTiming execution_timing = ExecutionTiming::NextBarOpen;
+    AssignmentPolicy assignment_policy = AssignmentPolicy::AutomaticITMExercise;
+
+    uint32_t spread_mc_paths = 1;
+    uint64_t spread_mc_seed = 42;
+    SpreadModelConfig spread_model;
+
+    MarginModelKind margin_model = MarginModelKind::Robinhood;
+    FeeSchedule fees;
+    RiskLimits risk;
+
+    // Fail-closed data gates. A position held through an adjustment with no
+    // OCC-confirmed lineage is rejected rather than silently carried.
+    bool require_occ_confirmed_lineage = true;
+    bool reject_fallback_analytics = true;
+    bool reject_stale_bars = true;
+};
+
+// Per-scenario results. Deterministic components are reported separately from
+// the stochastic spread cost so a reader can tell them apart.
+struct PathMetrics {
+    uint32_t scenario_id = 0;
+    Money net_pnl{};
+    Money realized_pnl{};
+    Money unrealized_pnl{};
+    Money fees{};
+    Money spread_cost{};
+    Money final_equity{};
+    Money peak_equity{};
+    Money max_drawdown{};
+    Money peak_margin_requirement{};
+    double return_fraction = 0.0;
+    int64_t fill_count = 0;
+    int64_t group_count = 0;
+    int64_t rejection_count = 0;
+    int64_t assignment_count = 0;
+    int64_t exercise_count = 0;
+    int64_t expiration_count = 0;
+    bool margin_breached = false;
+    bool ledger_reconciles = true;
+};
+
+// What a strategy is allowed to see at time T. Built from data already
+// published at T, so a strategy cannot read ahead even accidentally.
+struct MarketSnapshot {
+    Timestamp timestamp{};
+    std::vector<MarketBar> bars;
+    std::vector<OptionAnalytics> analytics;
+    std::unordered_map<std::string, Money> underlying_price;
+};
+
+struct AccountState {
+    Money cash{};
+    Money equity{};
+    Money margin_requirement{};
+    Money buying_power{};
+    Money realized_pnl{};
+    Money unrealized_pnl{};
+    Money fees_paid{};
+    int64_t open_position_count = 0;
+};
+
+class Engine {
+public:
+    explicit Engine(BacktestConfig cfg)
+        : cfg_(std::move(cfg)), margin_(make_margin_model(cfg_.margin_model)) {}
+
+    void set_registry(ContractRegistry registry) { registry_ = std::move(registry); }
+    const ContractRegistry& registry() const { return registry_; }
+
+    // Lineage transitions are applied before any bar of the session, so a
+    // position's identity is already correct when market data arrives.
+    void queue_corporate_actions(std::vector<CorporateActionTransition> events) {
+        pending_actions_ = std::move(events);
+    }
+
+    void begin_scenario(uint32_t scenario_id) {
+        scenario_id_ = scenario_id;
+        book_.clear();
+        ledger_.open(cfg_.initial_cash, cfg_.start);
+        pending_.clear();
+        fills_.clear();
+        rejections_.clear();
+        metrics_ = PathMetrics{};
+        metrics_.scenario_id = scenario_id;
+        metrics_.peak_equity = cfg_.initial_cash;
+        equity_curve_.clear();
+        next_order_id_ = 1;
+        applied_actions_.clear();
+        current_ = MarketSnapshot{};
+        day_start_equity_ = cfg_.initial_cash;
+        halted_ = false;
+    }
+
+    // Steps 1-3 and 6 of the required ordering: apply lineage effective before
+    // this instant, ingest the bars, then fill orders submitted earlier.
+    void begin_bar(MarketSnapshot snapshot) {
+        current_ = std::move(snapshot);
+        now_ = current_.timestamp;
+
+        apply_due_corporate_actions();
+        index_current_bars();
+        fill_pending_orders();
+    }
+
+    // Step 4: what the strategy may read.
+    const MarketSnapshot& snapshot() const { return current_; }
+
+    // Step 5: strategies submit declarative groups; the engine decides fills.
+    void submit_group(OrderGroup group) {
+        if (halted_) {
+            for (const Order& leg : group.legs) {
+                rejections_.push_back(OrderRejection{
+                    leg.order_id, group.group_id, now_, RejectReason::RiskLimitBreached,
+                    "trading halted by risk control"});
+                metrics_.rejection_count++;
+            }
+            return;
+        }
+        for (Order& leg : group.legs) {
+            if (leg.order_id == 0) leg.order_id = next_order_id_++;
+            leg.submitted_at = now_;
+            leg.group_id = group.group_id;
+        }
+        if (cfg_.execution_timing == ExecutionTiming::SameBarClose) {
+            execute_group(group, /*use_open=*/false);
+        } else {
+            pending_.push_back(std::move(group));
+        }
+    }
+
+    // Steps 7-9: settle expirations, revalue, enforce risk, record the path.
+    void end_bar() {
+        process_expirations();
+        const AccountState state = account_state();
+        enforce_risk(state);
+        record_equity(state);
+    }
+
+    AccountState account_state() const {
+        AccountState s;
+        s.cash = ledger_.cash();
+        s.realized_pnl = book_.realized_pnl_total() + book_.equity_realized_pnl();
+        s.unrealized_pnl = unrealized_pnl();
+        s.margin_requirement = current_margin().requirement;
+        s.equity = s.cash + position_market_value();
+        s.buying_power = s.equity - s.margin_requirement;
+        s.fees_paid = ledger_.fees_paid();
+        s.open_position_count = static_cast<int64_t>(book_.open_count());
+        return s;
+    }
+
+    const PathMetrics& metrics() const { return metrics_; }
+    const std::vector<Fill>& fills() const { return fills_; }
+    const std::vector<OrderRejection>& rejections() const { return rejections_; }
+    const std::vector<Money>& equity_curve() const { return equity_curve_; }
+    const Ledger& ledger() const { return ledger_; }
+    const PositionBook& positions() const { return book_; }
+    const BacktestConfig& config() const { return cfg_; }
+
+    PathMetrics finalize() {
+        const AccountState s = account_state();
+        metrics_.final_equity = s.equity;
+        metrics_.realized_pnl = s.realized_pnl;
+        metrics_.unrealized_pnl = s.unrealized_pnl;
+        metrics_.fees = s.fees_paid;
+        metrics_.net_pnl = s.equity - cfg_.initial_cash;
+        metrics_.ledger_reconciles = ledger_.reconciles();
+        if (!cfg_.initial_cash.is_zero()) {
+            metrics_.return_fraction =
+                static_cast<double>(metrics_.net_pnl.micros)
+                / static_cast<double>(cfg_.initial_cash.micros);
+        }
+        return metrics_;
+    }
+
+private:
+    // -----------------------------------------------------------------------
+    // Market indexing
+    // -----------------------------------------------------------------------
+    void index_current_bars() {
+        bar_index_.clear();
+        analytics_index_.clear();
+        for (const MarketBar& b : current_.bars) bar_index_[b.contract_version_id.value] = &b;
+        for (const OptionAnalytics& a : current_.analytics)
+            analytics_index_[a.contract_version_id.value] = &a;
+    }
+
+    const MarketBar* bar_for(ContractVersionId cv) const {
+        auto it = bar_index_.find(cv.value);
+        return it == bar_index_.end() ? nullptr : it->second;
+    }
+
+    const OptionAnalytics* analytics_for(ContractVersionId cv) const {
+        auto it = analytics_index_.find(cv.value);
+        return it == analytics_index_.end() ? nullptr : it->second;
+    }
+
+    // The mark the pipeline chose, so engine and pipeline agree on value.
+    Money mark_for(ContractVersionId cv) const {
+        const MarketBar* b = bar_for(cv);
+        if (b == nullptr) return last_mark(cv);
+        return b->valuation_price.is_zero() ? b->close : b->valuation_price;
+    }
+
+    Money last_mark(ContractVersionId cv) const {
+        auto it = last_mark_.find(cv.value);
+        return it == last_mark_.end() ? Money::zero() : it->second;
+    }
+
+    // -----------------------------------------------------------------------
+    // Corporate actions
+    // -----------------------------------------------------------------------
+    void apply_due_corporate_actions() {
+        for (const CorporateActionTransition& t : pending_actions_) {
+            if (t.effective_at > now_) continue;
+            if (t.source_available_at > now_) continue;
+            if (applied_actions_.count(t.lineage_event_id)) continue;
+
+            const int64_t held = book_.quantity_of(t.parent_version_id);
+            if (held == 0) { applied_actions_.insert(t.lineage_event_id); continue; }
+
+            if (!t.is_actionable()) {
+                if (cfg_.require_occ_confirmed_lineage) {
+                    // Refuse to carry a position through an adjustment we cannot
+                    // source. Guessing the conversion would silently corrupt
+                    // every downstream number.
+                    halted_ = true;
+                    rejections_.push_back(OrderRejection{
+                        0, 0, now_, RejectReason::UnconfirmedLineage,
+                        "position held through adjustment with no OCC-confirmed lineage"});
+                    metrics_.rejection_count++;
+                }
+                continue;
+            }
+
+            transfer_position(t, held);
+            applied_actions_.insert(t.lineage_event_id);
+        }
+    }
+
+    // Closes the parent and opens the child, moving the whole economic basis
+    // across so the adjustment itself produces no artificial P&L.
+    void transfer_position(const CorporateActionTransition& t, int64_t held) {
+        Position* parent = book_.find(t.parent_version_id);
+        if (parent == nullptr) return;
+        const Money basis = parent->cost_basis;
+
+        const int64_t child_qty = held / t.parent_contracts * t.child_contracts;
+        const OptionContractVersion* child = registry_.find(t.child_version_id);
+        if (child == nullptr || child_qty == 0) return;
+
+        // Remove the parent at its own average cost, which realizes nothing.
+        book_.apply(t.parent_version_id, EquityKind::Option, -held,
+                    parent->average_cost(), 1, now_);
+
+        // Open the child carrying the identical total basis.
+        const Money per_unit = Money{basis.micros / child_qty};
+        book_.apply(t.child_version_id, EquityKind::Option, child_qty, per_unit, 1, now_);
+    }
+
+    // -----------------------------------------------------------------------
+    // Order execution
+    // -----------------------------------------------------------------------
+    void fill_pending_orders() {
+        std::vector<OrderGroup> due = std::move(pending_);
+        pending_.clear();
+        for (OrderGroup& g : due) execute_group(g, /*use_open=*/true);
+    }
+
+    // Reference price for a fill. Under next-bar-open timing this is the open
+    // of the bar following the signal, which is why the signal cannot see it.
+    Money execution_mark(ContractVersionId cv, bool use_open) const {
+        const MarketBar* b = bar_for(cv);
+        if (b == nullptr) return Money::zero();
+        if (use_open && !b->open.is_zero()) return b->open;
+        return b->valuation_price.is_zero() ? b->close : b->valuation_price;
+    }
+
+    SpreadFeatures features_for(const Order& o, Money mark) const {
+        const OptionContractVersion* c = registry_.find(o.contract_version_id);
+        const MarketBar* b = bar_for(o.contract_version_id);
+        const OptionAnalytics* a = analytics_for(o.contract_version_id);
+
+        SpreadFeatures f;
+        f.mark_dollars = mark.to_double();
+        if (b != nullptr) {
+            f.volume = static_cast<double>(b->volume);
+            f.trade_count = static_cast<double>(b->trade_count);
+        }
+        if (a != nullptr) f.implied_volatility = a->implied_volatility;
+        if (c != nullptr) {
+            f.is_call = c->type == OptionType::Call;
+            f.days_to_expiry = static_cast<double>(now_.days_until(c->expiration));
+            const Money spot = underlying_of(c->underlying_symbol);
+            f.underlying_dollars = spot.to_double();
+            if (spot.micros > 0 && c->strike.micros > 0)
+                f.moneyness = std::log(c->strike.to_double() / spot.to_double());
+        }
+        return f;
+    }
+
+    Money underlying_of(const std::string& sym) const {
+        auto it = current_.underlying_price.find(sym);
+        if (it != current_.underlying_price.end()) return it->second;
+        auto fallback = last_underlying_.find(sym);
+        return fallback == last_underlying_.end() ? Money::zero() : fallback->second;
+    }
+
+    // Validates every leg, then commits all of them or none. A broker does not
+    // partially execute a spread, so neither does this.
+    void execute_group(OrderGroup& group, bool use_open) {
+        struct Planned {
+            Order order;
+            const OptionContractVersion* contract = nullptr;
+            Money mark{};
+            Money half_spread{};
+            Money fill_price{};
+            Money gross_cash{};
+            Money fees{};
+            int64_t multiplier = 100;
+        };
+
+        std::vector<Planned> plan;
+        plan.reserve(group.legs.size());
+        RejectReason reason = RejectReason::None;
+        std::string detail;
+
+        uint32_t leg_index = 0;
+        for (const Order& o : group.legs) {
+            Planned p;
+            p.order = o;
+            p.contract = registry_.find(o.contract_version_id);
+            if (p.contract == nullptr) { reason = RejectReason::ContractNotTradable; detail = "unknown contract version"; break; }
+            if (!p.contract->covers(now_)) { reason = RejectReason::ContractNotTradable; detail = "contract version not valid at fill time"; break; }
+
+            const bool opening = !o.reduce_only;
+            if (opening && !p.contract->tradable_for_new_positions) {
+                reason = RejectReason::ContractNotTradable;
+                detail = "contract not tradable for new positions";
+                break;
+            }
+
+            const MarketBar* b = bar_for(o.contract_version_id);
+            if (b == nullptr) { reason = RejectReason::NoMarketData; detail = "no bar at fill time"; break; }
+            if (cfg_.reject_stale_bars && b->stale) { reason = RejectReason::StaleMarketData; detail = "stale bar"; break; }
+            if (cfg_.reject_fallback_analytics && opening && !b->analytics_valid) {
+                reason = RejectReason::AnalyticsRejected;
+                detail = "analytics rejected by configuration";
+                break;
+            }
+
+            p.mark = execution_mark(o.contract_version_id, use_open);
+            if (p.mark.micros <= 0) { reason = RejectReason::NoMarketData; detail = "non-positive mark"; break; }
+            p.multiplier = p.contract->quote_multiplier;
+
+            DrawKey key{cfg_.spread_mc_seed, scenario_id_, o.order_id,
+                        p.contract->instrument_id.value, now_.epoch_ns, leg_index};
+            const double half = half_spread_dollars(
+                cfg_.spread_model, features_for(o, p.mark), key);
+            p.half_spread = Money::from_double(half);
+
+            // Buys cross the ask, sells cross the bid. Never the other way.
+            p.fill_price = (o.side == OrderSide::Buy) ? p.mark + p.half_spread
+                                                      : p.mark - p.half_spread;
+            if (p.fill_price.micros < 0) p.fill_price = Money::zero();
+
+            if (o.type == OrderType::Limit && o.limit_price.has_value()) {
+                const bool ok = (o.side == OrderSide::Buy)
+                    ? p.fill_price <= *o.limit_price
+                    : p.fill_price >= *o.limit_price;
+                if (!ok) { reason = RejectReason::LimitNotSatisfied; detail = "limit not satisfied at execution price"; break; }
+            }
+
+            const int64_t signed_qty = (o.side == OrderSide::Buy) ? o.quantity : -o.quantity;
+            // Cash out for a buy, cash in for a sell.
+            p.gross_cash = Money{-p.fill_price.micros * p.multiplier * signed_qty};
+            p.fees = cfg_.fees.option_fees(
+                o.side, o.quantity,
+                Money{p.fill_price.micros * p.multiplier * o.quantity});
+
+            plan.push_back(p);
+            leg_index++;
+        }
+
+        if (reason != RejectReason::None) {
+            reject_group(group, reason, detail);
+            return;
+        }
+
+        // Buying power and broker rules are checked against the portfolio the
+        // group would produce, not leg by leg, so a spread is not rejected for
+        // the naked requirement of its short leg alone.
+        if (!passes_margin_after(plan.size(), [&](PositionBook& probe) {
+                for (const Planned& p : plan) {
+                    const int64_t q = (p.order.side == OrderSide::Buy) ? p.order.quantity
+                                                                       : -p.order.quantity;
+                    probe.apply(p.order.contract_version_id, EquityKind::Option, q,
+                                p.fill_price, p.multiplier, now_);
+                }
+            }, plan, &reason, &detail)) {
+            reject_group(group, reason, detail);
+            return;
+        }
+
+        for (const Planned& p : plan) {
+            const int64_t signed_qty = (p.order.side == OrderSide::Buy) ? p.order.quantity
+                                                                        : -p.order.quantity;
+            book_.apply(p.order.contract_version_id, EquityKind::Option, signed_qty,
+                        p.fill_price, p.multiplier, now_);
+            book_.add_fees(p.order.contract_version_id, p.fees);
+
+            ledger_.post(now_, LedgerEntryKind::OptionPremium, p.gross_cash,
+                         p.order.contract_version_id, p.order.order_id, "option premium");
+            ledger_.post(now_, LedgerEntryKind::Fee, -p.fees,
+                         p.order.contract_version_id, p.order.order_id,
+                         cfg_.fees.schedule_id);
+
+            Fill f;
+            f.order_id = p.order.order_id;
+            f.group_id = group.group_id;
+            f.filled_at = now_;
+            f.contract_version_id = p.order.contract_version_id;
+            f.side = p.order.side;
+            f.quantity = p.order.quantity;
+            f.mark = p.mark;
+            f.fill_price = p.fill_price;
+            f.half_spread = p.half_spread;
+            f.multiplier = p.multiplier;
+            f.gross_cash = p.gross_cash;
+            f.fees = p.fees;
+            f.net_cash = p.gross_cash - p.fees;
+            fills_.push_back(f);
+
+            metrics_.fill_count++;
+            metrics_.spread_cost += f.spread_cost();
+        }
+        metrics_.group_count++;
+    }
+
+    void reject_group(const OrderGroup& group, RejectReason reason, const std::string& detail) {
+        for (const Order& o : group.legs) {
+            rejections_.push_back(OrderRejection{o.order_id, group.group_id, now_, reason, detail});
+            metrics_.rejection_count++;
+        }
+    }
+
+    template <typename Mutate, typename PlanVec>
+    bool passes_margin_after(size_t, Mutate mutate, const PlanVec& plan,
+                             RejectReason* reason, std::string* detail) const
+    {
+        PositionBook probe = book_;
+        mutate(probe);
+
+        const MarginResult res = margin_->evaluate(probe, registry_, margin_context());
+        if (res.disallowed) {
+            *reason = RejectReason::BrokerDisallowed;
+            *detail = res.disallowed_reason;
+            return false;
+        }
+
+        Money net_cash = ledger_.cash();
+        for (const auto& p : plan) net_cash += p.gross_cash - p.fees;
+        if (net_cash + probe_market_value(probe) - res.requirement < Money::zero()) {
+            *reason = RejectReason::InsufficientBuyingPower;
+            *detail = "requirement exceeds available buying power";
+            return false;
+        }
+
+        if (cfg_.risk.max_open_positions > 0
+            && static_cast<int64_t>(probe.open_count()) > cfg_.risk.max_open_positions) {
+            *reason = RejectReason::RiskLimitBreached;
+            *detail = "max open positions";
+            return false;
+        }
+        if (cfg_.risk.max_short_option_contracts > 0) {
+            int64_t shorts = 0;
+            for (const Position& p : probe.snapshot())
+                if (p.kind == EquityKind::Option && p.quantity < 0) shorts += -p.quantity;
+            if (shorts > cfg_.risk.max_short_option_contracts) {
+                *reason = RejectReason::RiskLimitBreached;
+                *detail = "max short option contracts";
+                return false;
+            }
+        }
+        return true;
+    }
+
+    MarginContext margin_context() const {
+        MarginContext ctx;
+        ctx.underlying_price = current_.underlying_price;
+        for (const auto& [sym, px] : last_underlying_)
+            ctx.underlying_price.emplace(sym, px);
+        for (const Position& p : book_.snapshot())
+            ctx.mark[p.contract_version_id.value] = mark_for(p.contract_version_id);
+        return ctx;
+    }
+
+    MarginResult current_margin() const {
+        return margin_->evaluate(book_, registry_, margin_context());
+    }
+
+    // -----------------------------------------------------------------------
+    // Valuation
+    // -----------------------------------------------------------------------
+    Money position_market_value() const { return probe_market_value(book_); }
+
+    Money probe_market_value(const PositionBook& book) const {
+        Money total = Money::zero();
+        for (const Position& p : book.snapshot()) {
+            const OptionContractVersion* c = registry_.find(p.contract_version_id);
+            const int64_t mult = c ? c->quote_multiplier : 100;
+            total += Money{mark_for(p.contract_version_id).micros * mult * p.quantity};
+        }
+        for (const EquityPosition& e : book.equity_snapshot())
+            total += Money{underlying_of(e.symbol).micros * e.shares};
+        return total;
+    }
+
+    Money unrealized_pnl() const {
+        Money total = Money::zero();
+        for (const Position& p : book_.snapshot()) {
+            const OptionContractVersion* c = registry_.find(p.contract_version_id);
+            const int64_t mult = c ? c->quote_multiplier : 100;
+            total += Money{mark_for(p.contract_version_id).micros * mult * p.quantity} - p.cost_basis;
+        }
+        for (const EquityPosition& e : book_.equity_snapshot())
+            total += Money{underlying_of(e.symbol).micros * e.shares} - e.cost_basis;
+        return total;
+    }
+
+    // -----------------------------------------------------------------------
+    // Expiration and settlement
+    // -----------------------------------------------------------------------
+    void process_expirations() {
+        if (cfg_.assignment_policy == AssignmentPolicy::ExplicitExerciseOnly) return;
+
+        for (const Position& p : book_.snapshot()) {
+            if (p.kind != EquityKind::Option || p.quantity == 0) continue;
+            const OptionContractVersion* c = registry_.find(p.contract_version_id);
+            if (c == nullptr || c->expiration > now_) continue;
+
+            const Money spot = underlying_of(c->underlying_symbol);
+            const Money intrinsic = (c->type == OptionType::Call)
+                ? max_money(spot - c->strike, Money::zero())
+                : max_money(c->strike - spot, Money::zero());
+
+            const bool exercise =
+                cfg_.assignment_policy != AssignmentPolicy::ExpirationOnly
+                && intrinsic >= automatic_exercise_threshold();
+
+            // Remove the option at zero, realizing the full remaining basis.
+            book_.apply(p.contract_version_id, EquityKind::Option, -p.quantity,
+                        Money::zero(), c->quote_multiplier, now_);
+            metrics_.expiration_count++;
+
+            if (!exercise) continue;
+
+            settle_physically(*c, p.quantity, spot);
+            if (p.quantity > 0) metrics_.exercise_count++;
+            else metrics_.assignment_count++;
+        }
+    }
+
+    // Physical delivery, which is what actually happens to equity options and
+    // what makes a covered call or an assigned short call behave correctly. A
+    // short call assigned without shares establishes a short stock position
+    // rather than settling to cash.
+    void settle_physically(const OptionContractVersion& c, int64_t contracts, Money spot) {
+        const int64_t shares_per = c.deliverable_shares_per_contract();
+        const int64_t shares = shares_per * (contracts < 0 ? -contracts : contracts);
+        const Money strike_cash = Money{c.strike.micros * shares};
+
+        const bool long_position = contracts > 0;
+        const bool call = c.type == OptionType::Call;
+
+        // Long call and short put receive shares; long put and short call deliver.
+        const bool receives_shares = (long_position && call) || (!long_position && !call);
+        const int64_t share_delta = receives_shares ? shares : -shares;
+        const Money cash_delta = receives_shares ? -strike_cash : strike_cash;
+
+        book_.apply_equity(c.underlying_symbol, share_delta, c.strike);
+        ledger_.post(now_,
+                     long_position ? LedgerEntryKind::ExerciseSettlement
+                                   : LedgerEntryKind::AssignmentSettlement,
+                     cash_delta, c.id, 0,
+                     receives_shares ? "received shares at strike" : "delivered shares at strike");
+
+        const Money fee = long_position ? cfg_.fees.exercise_fee : cfg_.fees.assignment_fee;
+        if (!fee.is_zero())
+            ledger_.post(now_, LedgerEntryKind::Fee, -fee, c.id, 0, "exercise/assignment fee");
+
+        if (!c.deliverable_cash.is_zero()) {
+            const Money extra = Money{c.deliverable_cash.micros * (contracts < 0 ? -contracts : contracts)};
+            ledger_.post(now_, LedgerEntryKind::CashSettlement,
+                         receives_shares ? extra : -extra, c.id, 0, "deliverable cash component");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Risk and reporting
+    // -----------------------------------------------------------------------
+    void enforce_risk(const AccountState& s) {
+        if (s.equity > metrics_.peak_equity) metrics_.peak_equity = s.equity;
+        const Money drawdown = metrics_.peak_equity - s.equity;
+        if (drawdown > metrics_.max_drawdown) metrics_.max_drawdown = drawdown;
+        if (s.margin_requirement > metrics_.peak_margin_requirement)
+            metrics_.peak_margin_requirement = s.margin_requirement;
+
+        if (s.margin_requirement > s.equity) metrics_.margin_breached = true;
+
+        const RiskLimits& r = cfg_.risk;
+        if (r.max_drawdown_fraction > 0.0 && !metrics_.peak_equity.is_zero()) {
+            const double frac = static_cast<double>(drawdown.micros)
+                              / static_cast<double>(metrics_.peak_equity.micros);
+            if (frac > r.max_drawdown_fraction) halted_ = true;
+        }
+        if (r.max_margin_usage_fraction > 0.0 && !s.equity.is_zero()) {
+            const double usage = static_cast<double>(s.margin_requirement.micros)
+                               / static_cast<double>(s.equity.micros);
+            if (usage > r.max_margin_usage_fraction) halted_ = true;
+        }
+        if (!r.max_daily_loss.is_zero() && (day_start_equity_ - s.equity) > r.max_daily_loss)
+            halted_ = true;
+    }
+
+    void record_equity(const AccountState& s) {
+        equity_curve_.push_back(s.equity);
+        for (const MarketBar& b : current_.bars)
+            last_mark_[b.contract_version_id.value] =
+                b.valuation_price.is_zero() ? b.close : b.valuation_price;
+        for (const auto& [sym, px] : current_.underlying_price) last_underlying_[sym] = px;
+    }
+
+    BacktestConfig cfg_;
+    std::unique_ptr<MarginModel> margin_;
+    ContractRegistry registry_;
+
+    PositionBook book_;
+    Ledger ledger_;
+    std::vector<OrderGroup> pending_;
+    std::vector<Fill> fills_;
+    std::vector<OrderRejection> rejections_;
+    std::vector<CorporateActionTransition> pending_actions_;
+    std::set<uint64_t> applied_actions_;
+
+    MarketSnapshot current_;
+    std::unordered_map<uint64_t, const MarketBar*> bar_index_;
+    std::unordered_map<uint64_t, const OptionAnalytics*> analytics_index_;
+    std::unordered_map<uint64_t, Money> last_mark_;
+    std::unordered_map<std::string, Money> last_underlying_;
+
+    std::vector<Money> equity_curve_;
+    PathMetrics metrics_;
+    Timestamp now_{};
+    uint32_t scenario_id_ = 0;
+    uint64_t next_order_id_ = 1;
+    Money day_start_equity_{};
+    bool halted_ = false;
+};
+
+} // namespace obt
