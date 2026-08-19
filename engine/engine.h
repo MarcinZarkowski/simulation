@@ -150,6 +150,12 @@ struct PathMetrics {
     Money worst_trade_pnl{};
     bool margin_breached = false;
     bool ledger_reconciles = true;
+    // Set when the engine could not source a contract transition and quarantined
+    // the affected position. The run's P&L past that point describes a book the
+    // engine has declared unsourceable, so a report must say so rather than
+    // presenting the number plainly.
+    bool truncated = false;
+    int64_t quarantined_positions = 0;
 };
 
 // What a strategy is allowed to see at time T. Built from data already
@@ -182,8 +188,14 @@ public:
 
     // Lineage transitions are applied before any bar of the session, so a
     // position's identity is already correct when market data arrives.
+    // Appends. Replacing silently dropped any transition whose effective date
+    // fell later than the next day carrying a lineage row, so a split queued on
+    // day 1 for day 10 never happened if day 2 also had lineage data.
     void queue_corporate_actions(std::vector<CorporateActionTransition> events) {
-        pending_actions_ = std::move(events);
+        for (CorporateActionTransition& t : events) {
+            if (queued_event_ids_.insert(t.lineage_event_id).second)
+                pending_actions_.push_back(std::move(t));
+        }
     }
 
     void begin_scenario(uint32_t scenario_id) {
@@ -202,6 +214,7 @@ public:
         trades_.clear();
         equity_points_.clear();
         applied_actions_.clear();
+        superseded_versions_.clear();
         current_ = MarketSnapshot{};
         day_start_equity_ = cfg_.initial_cash;
         halted_ = false;
@@ -358,26 +371,81 @@ private:
             if (t.source_available_at > now_) continue;
             if (applied_actions_.count(t.lineage_event_id)) continue;
 
+            // The parent version stops being tradable at the effective date
+            // whether or not anything is held. Recording that separately closes
+            // the hole where an order already in flight filled onto a dead
+            // version, because corporate actions are applied before pending
+            // fills within the same bar.
+            superseded_versions_.insert(t.parent_version_id.value);
+
             const int64_t held = book_.quantity_of(t.parent_version_id);
-            if (held == 0) { applied_actions_.insert(t.lineage_event_id); continue; }
+            if (held == 0) {
+                // Nothing to convert now, but a pending order may still land on
+                // the parent this bar, so do not mark it applied yet.
+                continue;
+            }
 
             if (!t.is_actionable()) {
                 if (cfg_.require_occ_confirmed_lineage) {
                     // Refuse to carry a position through an adjustment we cannot
-                    // source. Guessing the conversion would silently corrupt
-                    // every downstream number.
-                    halted_ = true;
-                    rejections_.push_back(OrderRejection{
-                        0, 0, now_, RejectReason::UnconfirmedLineage,
-                        "position held through adjustment with no OCC-confirmed lineage"});
-                    metrics_.rejection_count++;
+                    // source. Guessing the conversion would corrupt every
+                    // downstream number, so the position is quarantined at its
+                    // last observed mark and the run is flagged truncated -- one
+                    // rejection, not one per bar forever.
+                    quarantine(t.parent_version_id, held,
+                               "adjustment has no OCC-confirmed lineage");
+                    applied_actions_.insert(t.lineage_event_id);
                 }
+                continue;
+            }
+
+            // A conversion that does not divide evenly cannot be applied without
+            // inventing or destroying exposure. OCC settles the remainder in cash,
+            // which is a primitive this engine does not have, so refuse rather
+            // than truncate: held=3 under a 2-for-3 conversion is 4.5 contracts,
+            // and truncating to 3 silently discarded a third of the position.
+            if (held % t.parent_contracts != 0) {
+                quarantine(t.parent_version_id, held,
+                           "quantity conversion does not divide the holding evenly");
+                applied_actions_.insert(t.lineage_event_id);
                 continue;
             }
 
             transfer_position(t, held);
             applied_actions_.insert(t.lineage_event_id);
         }
+    }
+
+    // Closes a position the engine cannot legitimately carry forward, at its last
+    // observed mark, and stops marking it. Leaving it open would keep producing a
+    // P&L for a book the engine has already declared unsourceable.
+    void quarantine(ContractVersionId cv, int64_t held, const std::string& why) {
+        const Position* p = book_.find(cv);
+        const OptionContractVersion* c = registry_.find(cv);
+        const int64_t multiplier = c ? c->quote_multiplier : 100;
+        const Money mark = mark_for(cv);
+        const Money entry_avg = p ? p->average_cost() : Money::zero();
+        const Timestamp opened_at = p ? p->opened_at : now_;
+
+        const ApplyFillResult applied = book_.apply(
+            cv, EquityKind::Option, -held, mark, multiplier, now_);
+        ledger_.post(now_, LedgerEntryKind::CorporateActionCash,
+                     Money{mark.micros * multiplier * held}, cv, 0,
+                     "quarantined at last mark: " + why);
+
+        record_trade(TradeRecord{
+            next_trade_id_++, cv, 0, 0, opened_at, now_,
+            held < 0 ? -held : held, held < 0,
+            Money{entry_avg.micros / multiplier}, mark,
+            applied.realized_pnl, Money::zero(), Money::zero(),
+            CloseReason::Adjusted, multiplier,
+        });
+
+        rejections_.push_back(OrderRejection{
+            0, 0, now_, RejectReason::UnconfirmedLineage, why});
+        metrics_.rejection_count++;
+        metrics_.truncated = true;
+        metrics_.quarantined_positions++;
     }
 
     // Closes the parent and opens the child, moving the whole economic basis
@@ -494,6 +562,11 @@ private:
             p.contract = registry_.find(o.contract_version_id);
             if (p.contract == nullptr) { reason = RejectReason::ContractNotTradable; detail = "unknown contract version"; break; }
             if (!p.contract->covers(now_)) { reason = RejectReason::ContractNotTradable; detail = "contract version not valid at fill time"; break; }
+            if (superseded_versions_.count(o.contract_version_id.value)) {
+                reason = RejectReason::ContractNotTradable;
+                detail = "contract version superseded by a contract adjustment";
+                break;
+            }
 
             const bool opening = !o.reduce_only;
             if (opening && !p.contract->tradable_for_new_positions) {
@@ -928,6 +1001,8 @@ private:
     std::vector<OrderRejection> rejections_;
     std::vector<CorporateActionTransition> pending_actions_;
     std::set<uint64_t> applied_actions_;
+    std::set<uint64_t> queued_event_ids_;
+    std::set<uint64_t> superseded_versions_;
 
     MarketSnapshot current_;
     std::unordered_map<uint64_t, const MarketBar*> bar_index_;

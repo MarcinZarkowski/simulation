@@ -73,6 +73,8 @@ class MonteCarloReport:
     total_rejections: int
     ledger_reconciles: bool
     degenerate: bool
+    truncated_paths: int
+    quarantined_positions: int
 
     def summary(self) -> str:
         pct = self.confidence_level * 100
@@ -120,6 +122,15 @@ class MonteCarloReport:
             f"  fills {self.total_fills}   rejections {self.total_rejections}"
             f"   ledger reconciles {self.ledger_reconciles}",
         ]
+        if self.truncated_paths:
+            lines += [
+                "",
+                f"  TRUNCATED: {self.truncated_paths} of {self.paths} path(s) quarantined "
+                f"{self.quarantined_positions} position(s).",
+                "  A contract adjustment could not be sourced, so the affected position was",
+                "  closed at its last observed mark rather than carried through a conversion",
+                "  the engine cannot justify. P&L past that point describes a reduced book.",
+            ]
         return "\n".join(lines)
 
 
@@ -304,6 +315,8 @@ def build_report(result: RunResult, confidence_level: float = 0.95,
         total_fills=sum(p.fill_count for p in paths),
         total_rejections=sum(p.rejection_count for p in paths),
         ledger_reconciles=all(p.ledger_reconciles for p in paths),
+        truncated_paths=sum(1 for p in paths if p.truncated),
+        quarantined_positions=sum(p.quarantined_positions for p in paths),
         # More than one path but only one outcome: the Monte Carlo said nothing.
         degenerate=n > 1 and stdev == 0.0,
     )

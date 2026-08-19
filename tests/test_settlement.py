@@ -376,3 +376,126 @@ class TestSessionCloseSettlement:
         h.engine.end_session(self.NEXT_SESSION_CLOSE)
         assert h.cash_micros == cash_after_first
         assert h.finalize().expiration_count == 1
+
+
+class TestCorporateActionFailClosed:
+    """
+    An adjustment the engine cannot source must reduce the book, not silently
+    reshape it. Two of these paths previously failed OPEN while the documentation
+    promised fail-closed.
+    """
+
+    PARENT = 1
+    CHILD = 2
+    EFFECTIVE = 10
+
+    def _transition(self, parent_contracts, child_contracts, *, confirmed=True,
+                    effective=EFFECTIVE, event_id=1):
+        t = E.CorporateActionTransition()
+        t.lineage_event_id = event_id
+        t.effective_at = day_ns(effective)
+        t.source_available_at = day_ns(effective)
+        t.parent_version_id = self.PARENT
+        t.child_version_id = self.CHILD
+        t.parent_contracts = parent_contracts
+        t.child_contracts = child_contracts
+        t.occ_confirmed = confirmed
+        return t
+
+    def _held_through(self, held, transitions, *, bars_after=2):
+        parent = make_contract(self.PARENT, symbol="P", strike=100.0, expiry_day=400)
+        child = make_contract(self.CHILD, symbol="C", strike=25.0, expiry_day=400)
+        h = EngineHarness(base_config(cash=500_000.0), [parent, child])
+        h.engine.queue_corporate_actions(transitions)
+        h.bar(day_ns(1), [make_bar(self.PARENT, timestamp_ns=day_ns(1), price=10.0)],
+              groups=[group(buy(self.PARENT, held))])
+        h.bar(day_ns(2), [make_bar(self.PARENT, timestamp_ns=day_ns(2), price=10.0)])
+        for d in range(self.EFFECTIVE + 1, self.EFFECTIVE + 1 + bars_after):
+            h.bar(day_ns(d), [make_bar(self.PARENT, timestamp_ns=day_ns(d), price=10.0),
+                              make_bar(self.CHILD, timestamp_ns=day_ns(d), price=2.50)])
+        return h
+
+    def test_an_even_conversion_transfers_the_position(self):
+        h = self._held_through(2, [self._transition(1, 4)])
+        assert h.quantity_of(self.CHILD) == 8
+        assert h.quantity_of(self.PARENT) == 0
+        assert not h.finalize().truncated
+
+    def test_an_uneven_conversion_quarantines_rather_than_truncating(self):
+        """
+        Three contracts under a 2-for-3 conversion is 4.5 contracts. Truncating to
+        3 silently discarded a third of the exposure; OCC settles the remainder in
+        cash, which this engine has no primitive for, so it refuses.
+        """
+        h = self._held_through(3, [self._transition(2, 3)])
+        metrics = h.finalize()
+        assert h.positions() == []
+        assert metrics.truncated
+        assert metrics.quarantined_positions == 1
+
+    def test_a_holding_too_small_to_convert_is_not_stranded(self):
+        """One contract under a 2-for-3 conversion rounded to zero children."""
+        h = self._held_through(1, [self._transition(2, 3)])
+        assert h.positions() == []
+        assert h.finalize().truncated
+
+    def test_an_unconfirmed_adjustment_emits_one_rejection_not_one_per_bar(self):
+        h = self._held_through(1, [self._transition(1, 4, confirmed=False)],
+                               bars_after=10)
+        assert len(h.rejections()) == 1
+        assert h.rejections()[0].reason == E.RejectReason.UNCONFIRMED_LINEAGE
+
+    def test_an_unconfirmed_adjustment_closes_the_position(self):
+        """
+        Leaving it open kept marking a book the engine had declared unsourceable,
+        so the run went on producing a P&L for it.
+        """
+        h = self._held_through(1, [self._transition(1, 4, confirmed=False)],
+                               bars_after=10)
+        assert h.positions() == []
+        assert h.finalize().truncated
+        assert h.engine.ledger_reconciles()
+
+    def test_quarantining_records_a_trade_with_an_adjusted_reason(self):
+        h = self._held_through(1, [self._transition(1, 4, confirmed=False)])
+        assert any(t.reason == E.CloseReason.ADJUSTED for t in h.engine.trades())
+
+    def test_queueing_twice_keeps_both_events(self):
+        """
+        Replacing rather than appending silently dropped any transition whose
+        effective date fell after the next day carrying lineage data.
+        """
+        parent = make_contract(self.PARENT, symbol="P", strike=100.0, expiry_day=400)
+        child = make_contract(self.CHILD, symbol="C", strike=25.0, expiry_day=400)
+        h = EngineHarness(base_config(cash=500_000.0), [parent, child])
+        h.engine.queue_corporate_actions([self._transition(1, 4, event_id=1)])
+        h.engine.queue_corporate_actions(
+            [self._transition(1, 4, effective=20, event_id=2)])
+
+        h.bar(day_ns(1), [make_bar(self.PARENT, timestamp_ns=day_ns(1), price=10.0)],
+              groups=[group(buy(self.PARENT, 1))])
+        h.bar(day_ns(2), [make_bar(self.PARENT, timestamp_ns=day_ns(2), price=10.0)])
+        for d in (11, 12):
+            h.bar(day_ns(d), [make_bar(self.PARENT, timestamp_ns=day_ns(d), price=10.0),
+                              make_bar(self.CHILD, timestamp_ns=day_ns(d), price=2.50)])
+        assert h.quantity_of(self.CHILD) == 4
+
+    def test_a_superseded_version_cannot_be_traded(self):
+        """
+        Adjustments are applied before pending fills within a bar, so an order
+        already in flight could land on a version the adjustment had just retired.
+        """
+        parent = make_contract(self.PARENT, symbol="P", strike=100.0, expiry_day=400)
+        child = make_contract(self.CHILD, symbol="C", strike=25.0, expiry_day=400)
+        h = EngineHarness(base_config(cash=500_000.0), [parent, child])
+        h.engine.queue_corporate_actions([self._transition(1, 4)])
+
+        h.bar(day_ns(self.EFFECTIVE),
+              [make_bar(self.PARENT, timestamp_ns=day_ns(self.EFFECTIVE), price=10.0)],
+              groups=[group(buy(self.PARENT, 1))])
+        h.bar(day_ns(self.EFFECTIVE + 1),
+              [make_bar(self.PARENT, timestamp_ns=day_ns(self.EFFECTIVE + 1), price=10.0)])
+
+        assert h.quantity_of(self.PARENT) == 0
+        assert any(r.reason == E.RejectReason.CONTRACT_NOT_TRADABLE
+                   for r in h.rejections())

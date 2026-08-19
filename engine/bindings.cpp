@@ -454,7 +454,9 @@ PYBIND11_MODULE(obt_engine, m) {
         .def_property_readonly("best_trade_pnl", [](const PathMetrics& p) { return p.best_trade_pnl.to_double(); })
         .def_property_readonly("worst_trade_pnl", [](const PathMetrics& p) { return p.worst_trade_pnl.to_double(); })
         .def_readonly("margin_breached", &PathMetrics::margin_breached)
-        .def_readonly("ledger_reconciles", &PathMetrics::ledger_reconciles);
+        .def_readonly("ledger_reconciles", &PathMetrics::ledger_reconciles)
+        .def_readonly("truncated", &PathMetrics::truncated)
+        .def_readonly("quarantined_positions", &PathMetrics::quarantined_positions);
 
     py::enum_<CloseReason>(m, "CloseReason")
         .value("CLOSED", CloseReason::Closed)
