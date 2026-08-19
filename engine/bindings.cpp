@@ -296,6 +296,7 @@ PYBIND11_MODULE(obt_engine, m) {
         .def_property_readonly("half_spread", [](const Fill& f) { return f.half_spread.to_double(); })
         .def_property_readonly("gross_cash", [](const Fill& f) { return f.gross_cash.to_double(); })
         .def_property_readonly("fees", [](const Fill& f) { return f.fees.to_double(); })
+        .def_property_readonly("fees_micros", [](const Fill& f) { return f.fees.micros; })
         .def_property_readonly("net_cash", [](const Fill& f) { return f.net_cash.to_double(); })
         .def_property_readonly("net_cash_micros", [](const Fill& f) { return f.net_cash.micros; })
         .def_readonly("multiplier", &Fill::multiplier);
@@ -447,6 +448,7 @@ PYBIND11_MODULE(obt_engine, m) {
         .def_property_readonly("realized_pnl", [](const PathMetrics& p) { return p.realized_pnl.to_double(); })
         .def_property_readonly("unrealized_pnl", [](const PathMetrics& p) { return p.unrealized_pnl.to_double(); })
         .def_property_readonly("fees", [](const PathMetrics& p) { return p.fees.to_double(); })
+        .def_property_readonly("fees_micros", [](const PathMetrics& p) { return p.fees.micros; })
         .def_property_readonly("spread_cost", [](const PathMetrics& p) { return p.spread_cost.to_double(); })
         .def_property_readonly("spread_cost_micros", [](const PathMetrics& p) { return p.spread_cost.micros; })
         .def_property_readonly("final_equity", [](const PathMetrics& p) { return p.final_equity.to_double(); })
@@ -498,7 +500,10 @@ PYBIND11_MODULE(obt_engine, m) {
         .def_property_readonly("realized_pnl", [](const TradeRecord& t) { return t.realized_pnl.to_double(); })
         .def_property_readonly("realized_pnl_micros", [](const TradeRecord& t) { return t.realized_pnl.micros; })
         .def_property_readonly("fees", [](const TradeRecord& t) { return t.fees.to_double(); })
+        .def_property_readonly("fees_micros", [](const TradeRecord& t) { return t.fees.micros; })
         .def_property_readonly("spread_cost", [](const TradeRecord& t) { return t.spread_cost.to_double(); })
+        .def_property_readonly("spread_cost_micros",
+            [](const TradeRecord& t) { return t.spread_cost.micros; })
         .def_readonly("reason", &TradeRecord::reason)
         .def_readonly("multiplier", &TradeRecord::multiplier)
         .def_property_readonly("holding_days", &TradeRecord::holding_days);

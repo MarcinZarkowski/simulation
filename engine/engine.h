@@ -724,10 +724,12 @@ private:
             const Timestamp opened_at = existing ? existing->opened_at : now_;
             const bool was_short = existing && existing->quantity < 0;
 
+            const Money fill_spread_cost =
+                Money{p.half_spread.micros * (signed_qty < 0 ? -signed_qty : signed_qty)
+                      * p.multiplier};
             const ApplyFillResult applied = book_.apply(
                 p.order.contract_version_id, EquityKind::Option, signed_qty,
-                p.fill_price, p.multiplier, now_);
-            book_.add_fees(p.order.contract_version_id, p.fees);
+                p.fill_price, p.multiplier, now_, p.fees, fill_spread_cost);
 
             if (applied.closed_quantity > 0) {
                 record_trade(TradeRecord{
@@ -735,8 +737,9 @@ private:
                     /*open_group_id=*/0, group.group_id, opened_at, now_,
                     applied.closed_quantity, was_short,
                     Money{prior_avg.micros / p.multiplier}, p.fill_price,
-                    applied.realized_pnl, p.fees,
-                    Money{p.half_spread.micros * applied.closed_quantity * p.multiplier},
+                    applied.realized_pnl,
+                    // Both legs, not just this one.
+                    applied.round_trip_fees, applied.round_trip_spread_cost,
                     CloseReason::Closed, p.multiplier,
                 });
             }
@@ -989,7 +992,10 @@ private:
                 Money{entry_avg.micros / c->quote_multiplier},
                 // An expiring option is closed at zero; the intrinsic it settles
                 // into shows up in the settlement cash flow, not here.
-                Money::zero(), applied.realized_pnl, Money::zero(), Money::zero(),
+                Money::zero(), applied.realized_pnl,
+                // Entry-side costs still belong to the round trip. A call bought
+                // and held to worthless expiry paid a fee and crossed a spread.
+                applied.round_trip_fees, applied.round_trip_spread_cost,
                 reason, c->quote_multiplier,
             });
 
@@ -1118,7 +1124,8 @@ private:
                 next_trade_id_++, p.contract_version_id, 0, 0,
                 p.opened_at, now_, assigned, true,
                 Money{entry_avg.micros / c->quote_multiplier},
-                Money::zero(), applied.realized_pnl, Money::zero(), Money::zero(),
+                Money::zero(), applied.realized_pnl,
+                applied.round_trip_fees, applied.round_trip_spread_cost,
                 CloseReason::Assigned, c->quote_multiplier,
             });
             settle_physically(*c, p.quantity, spot_it->second);

@@ -71,6 +71,8 @@ class MonteCarloReport:
     percentiles: dict[str, float]
     total_fills: int
     total_rejections: int
+    mean_dividend_cash: float
+    total_early_assignments: int
     ledger_reconciles: bool
     degenerate: bool
     truncated_paths: int
@@ -110,6 +112,17 @@ class MonteCarloReport:
             f"  mean fees           {_fmt(self.mean_fees)}",
             f"  mean max drawdown   {_fmt(self.mean_max_drawdown)}",
         ]
+        if self.mean_dividend_cash:
+            lines.append(
+                f"  mean dividend cash  {_fmt(self.mean_dividend_cash)}"
+                "   (negative = owed on short shares)")
+        if self.total_early_assignments:
+            lines += [
+                "",
+                f"  early assignments   {self.total_early_assignments:>14}",
+                "  Short calls taken before an ex-dividend date, where the dividend",
+                "  exceeded the extrinsic value the holder gave up by exercising.",
+            ]
         if abs(self.separability_residual) > 0.005:
             lines += [
                 "",
@@ -314,6 +327,8 @@ def build_report(result: RunResult, confidence_level: float = 0.95,
                      for q in (0.05, 0.25, 0.50, 0.75, 0.95)},
         total_fills=sum(p.fill_count for p in paths),
         total_rejections=sum(p.rejection_count for p in paths),
+        mean_dividend_cash=statistics.fmean(p.dividend_cash for p in paths),
+        total_early_assignments=sum(p.early_assignment_count for p in paths),
         ledger_reconciles=all(p.ledger_reconciles for p in paths),
         truncated_paths=sum(1 for p in paths if p.truncated),
         quarantined_positions=sum(p.quarantined_positions for p in paths),

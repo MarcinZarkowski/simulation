@@ -359,3 +359,106 @@ class TestEquityValuation:
         h.bar(day_ns(2), [make_bar(CALL, timestamp_ns=day_ns(2), price=5.00)])
         state = h.bar(day_ns(3), [make_bar(CALL, timestamp_ns=day_ns(3), price=6.25)])
         assert state.unrealized_pnl == pytest.approx(1.25 * 100)
+
+
+class TestRoundTripCostAttribution:
+    """
+    A TradeRecord is written on the CLOSING fill, so it used to record only the
+    closing leg's fees and spread cost. The opening leg's costs were never
+    attributed to the round trip, and the report's per-trade fee and spread
+    figures came out at roughly half what the path actually paid: $5.58 against
+    $10.02 of fees, $120.50 against $237.99 of spread cost, on the same run.
+    """
+
+    def _round_trip(self, *, contracts: int = 1, closes: tuple[int, ...] = (1,),
+                    spread=E.SpreadModelKind.PROPORTIONAL_BPS, fees: bool = True,
+                    expire: bool = False):
+        contract = make_contract(CALL, strike=100.0, expiry_day=8)
+        cfg = base_config(spread=spread, fees=fees)
+        h = EngineHarness(cfg, [contract])
+        day = 1
+        h.bar(day_ns(day), [make_bar(CALL, timestamp_ns=day_ns(day), price=5.0)],
+              groups=[group(buy(CALL, contracts))])
+        day += 1
+        for closing in closes:
+            h.bar(day_ns(day), [make_bar(CALL, timestamp_ns=day_ns(day), price=6.0)],
+                  groups=[group(sell(CALL, closing, reduce_only=True))])
+            day += 1
+        # One more bar so the final closing order fills.
+        h.bar(day_ns(day), [make_bar(CALL, timestamp_ns=day_ns(day), price=6.0)])
+        if expire:
+            h.bar(day_ns(9), [make_bar(CALL, timestamp_ns=day_ns(9), price=6.0)])
+            h.engine.end_session(day_ns(9) + 3_600_000_000_000)
+        return h
+
+    def test_trade_fees_account_for_both_legs(self):
+        h = self._round_trip()
+        trades = h.engine.trades()
+
+        assert len(trades) == 1
+        assert trades[0].fees_micros == h.finalize().fees_micros
+
+    def test_trade_spread_cost_accounts_for_both_legs(self):
+        h = self._round_trip()
+        trades = h.engine.trades()
+
+        assert trades[0].spread_cost_micros == h.finalize().spread_cost_micros
+
+    def test_closing_only_one_leg_would_halve_the_figure(self):
+        """
+        Guards the specific defect: entry and exit are priced differently, so if
+        only the exit were counted the totals could not match.
+        """
+        h = self._round_trip()
+        fills = h.fills()
+
+        assert len(fills) == 2
+        assert fills[0].fees_micros > 0 and fills[1].fees_micros > 0
+        assert h.engine.trades()[0].fees_micros == sum(f.fees_micros for f in fills)
+
+    def test_partial_closes_sum_to_the_whole(self):
+        """
+        Entry costs release proportionally, the same way cost basis does, so three
+        partial exits together carry exactly the one entry's costs.
+        """
+        h = self._round_trip(contracts=6, closes=(1, 2, 3))
+        trades = h.engine.trades()
+        metrics = h.finalize()
+
+        assert len(trades) == 3
+        assert h.quantity_of(CALL) == 0
+        assert sum(t.fees_micros for t in trades) == metrics.fees_micros
+        assert sum(t.spread_cost_micros for t in trades) == metrics.spread_cost_micros
+
+    def test_an_expiring_position_still_carries_its_entry_costs(self):
+        """
+        A call bought and held to worthless expiry paid a fee and crossed a spread.
+        The expiration path recorded zero for both.
+        """
+        contract = make_contract(CALL, strike=200.0, expiry_day=4)
+        h = EngineHarness(base_config(spread=E.SpreadModelKind.PROPORTIONAL_BPS, fees=True),
+                          [contract])
+        for day in (1, 2):
+            groups = [group(buy(CALL, 2))] if day == 1 else []
+            h.bar(day_ns(day), [make_bar(CALL, timestamp_ns=day_ns(day), price=1.0)],
+                  groups=groups)
+        h.bar(day_ns(4), [make_bar(CALL, timestamp_ns=day_ns(4), price=0.01)],
+              underlying={"TEST": 100.0})
+        h.engine.end_session(day_ns(4) + 3_600_000_000_000)
+
+        expired = [t for t in h.engine.trades() if t.reason == E.CloseReason.EXPIRED]
+        assert len(expired) == 1
+        assert expired[0].fees_micros == h.finalize().fees_micros > 0
+        assert expired[0].spread_cost_micros == h.finalize().spread_cost_micros > 0
+
+    def test_a_still_open_position_holds_its_entry_costs_back(self):
+        """
+        Entry costs are attributed when the round trip closes, not before, so an
+        open position contributes nothing to trade statistics yet.
+        """
+        h = self._round_trip(contracts=4, closes=(1,))
+
+        assert h.quantity_of(CALL) == 3
+        trades = h.engine.trades()
+        assert len(trades) == 1
+        assert 0 < trades[0].fees_micros < h.finalize().fees_micros

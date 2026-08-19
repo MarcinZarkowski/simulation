@@ -20,7 +20,13 @@ struct Position {
     int64_t quantity = 0;
     Money cost_basis{};
     Money realized_pnl{};
-    Money fees_paid{};
+    // Entry-side costs on the quantity still open, held here until the round trip
+    // closes and can be charged for both legs. A TradeRecord is written on the
+    // closing fill, so without this the opening leg's fees and spread cost never
+    // reached the trade -- per-trade fees read as roughly half the fees the path
+    // actually paid.
+    Money open_fees{};
+    Money open_spread_cost{};
     Timestamp opened_at{};
     Timestamp last_updated_at{};
 
@@ -56,6 +62,10 @@ struct ApplyFillResult {
     int64_t closed_quantity = 0;
     int64_t opened_quantity = 0;
     Money realized_pnl{};
+    // Both legs' costs on the quantity this fill closed: the entry-side costs
+    // released proportionally, plus this fill's own share.
+    Money round_trip_fees{};
+    Money round_trip_spread_cost{};
 };
 
 class PositionBook {
@@ -67,7 +77,8 @@ public:
     // cash out -- including when the position was built at several prices.
     ApplyFillResult apply(
         ContractVersionId cv, EquityKind kind, int64_t signed_qty,
-        Money price_per_unit, int64_t multiplier, Timestamp at)
+        Money price_per_unit, int64_t multiplier, Timestamp at,
+        Money fees = Money::zero(), Money spread_cost = Money::zero())
     {
         Position& p = positions_[cv.value];
         if (p.contract_version_id.value == 0 && p.quantity == 0) {
@@ -97,38 +108,50 @@ public:
             // Proceeds of the closing trade, signed against the position.
             const Money proceeds = Money{unit_value.micros * (p.quantity > 0 ? closable : -closable)};
 
+            // Entry-side costs release on the same proportion as the basis.
+            const Money released_fees = Money{p.open_fees.micros * closable / p.abs_quantity()};
+            const Money released_spread =
+                Money{p.open_spread_cost.micros * closable / p.abs_quantity()};
+            p.open_fees -= released_fees;
+            p.open_spread_cost -= released_spread;
+
             out.closed_quantity = closable;
             out.realized_pnl = proceeds - released;
             p.realized_pnl += out.realized_pnl;
             p.cost_basis -= released;
             p.quantity += (signed_qty > 0 ? closable : -closable);
 
-            const int64_t remainder = (signed_qty < 0 ? -signed_qty : signed_qty) - closable;
+            const int64_t total = signed_qty < 0 ? -signed_qty : signed_qty;
+            // A fill that crosses through zero splits its own cost between the
+            // part that closed and the part that opened.
+            const Money closing_fees = Money{fees.micros * closable / total};
+            const Money closing_spread = Money{spread_cost.micros * closable / total};
+            out.round_trip_fees = released_fees + closing_fees;
+            out.round_trip_spread_cost = released_spread + closing_spread;
+
+            const int64_t remainder = total - closable;
             if (remainder > 0) {
                 const int64_t dir = signed_qty > 0 ? 1 : -1;
                 p.quantity += dir * remainder;
                 p.cost_basis += Money{unit_value.micros * dir * remainder};
+                p.open_fees += fees - closing_fees;
+                p.open_spread_cost += spread_cost - closing_spread;
                 out.opened_quantity = remainder;
                 p.opened_at = at;
             }
         } else {
             p.quantity += signed_qty;
             p.cost_basis += Money{unit_value.micros * signed_qty};
+            p.open_fees += fees;
+            p.open_spread_cost += spread_cost;
             out.opened_quantity = signed_qty < 0 ? -signed_qty : signed_qty;
         }
 
         if (p.quantity == 0) {
             realized_closed_ += p.realized_pnl;
-            fees_closed_ += p.fees_paid;
             positions_.erase(cv.value);
         }
         return out;
-    }
-
-    void add_fees(ContractVersionId cv, Money fees) {
-        auto it = positions_.find(cv.value);
-        if (it != positions_.end()) it->second.fees_paid += fees;
-        else fees_closed_ += fees;
     }
 
     Position* find(ContractVersionId cv) {
@@ -224,7 +247,6 @@ public:
         positions_.clear();
         equities_.clear();
         realized_closed_ = Money::zero();
-        fees_closed_ = Money::zero();
         equity_realized_closed_ = Money::zero();
         next_position_id_ = 1;
     }
@@ -233,7 +255,6 @@ private:
     std::unordered_map<uint64_t, Position> positions_;
     std::unordered_map<std::string, EquityPosition> equities_;
     Money realized_closed_{};
-    Money fees_closed_{};
     Money equity_realized_closed_{};
     uint64_t next_position_id_ = 1;
 };
