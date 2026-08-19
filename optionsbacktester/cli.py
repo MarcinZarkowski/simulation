@@ -47,7 +47,6 @@ MARGIN_MODELS = {
     "cash": E.MarginModel.CASH_ACCOUNT,
     "reg_t": E.MarginModel.REG_T,
     "robinhood": E.MarginModel.ROBINHOOD,
-    "portfolio": E.MarginModel.PORTFOLIO_APPROX,
 }
 
 # Path counts for the convergence check the spec requires before trusting a

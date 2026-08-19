@@ -83,8 +83,7 @@ PYBIND11_MODULE(obt_engine, m) {
     py::enum_<MarginModelKind>(m, "MarginModel")
         .value("CASH_ACCOUNT", MarginModelKind::CashAccount)
         .value("REG_T", MarginModelKind::RegT)
-        .value("ROBINHOOD", MarginModelKind::Robinhood)
-        .value("PORTFOLIO_APPROX", MarginModelKind::PortfolioApprox);
+        .value("ROBINHOOD", MarginModelKind::Robinhood);
 
     py::enum_<SpreadModelKind>(m, "SpreadModelKind")
         .value("ZERO", SpreadModelKind::Zero)
@@ -368,6 +367,8 @@ PYBIND11_MODULE(obt_engine, m) {
     py::class_<FeeSchedule>(m, "FeeSchedule")
         .def(py::init<>())
         .def_static("zero", &FeeSchedule::zero)
+        .def_static("robinhood_index_options", &FeeSchedule::robinhood_index_options,
+                    py::arg("gold") = false)
         .def_property("commission_per_contract",
             [](const FeeSchedule& f) { return f.commission_per_contract.to_double(); },
             [](FeeSchedule& f, double v) { f.commission_per_contract = money_from(v); })

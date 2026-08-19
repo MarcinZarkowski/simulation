@@ -42,14 +42,30 @@ struct FeeSchedule {
     // exact reconstruction.
     Money regulatory_per_contract = Money::from_double(0.04);
 
-    // Consolidated Audit Trail, both sides.
-    Money cat_per_contract = Money::from_double(0.0003);
+    // Consolidated Audit Trail. Regulators stopped charging it for equity and
+    // options orders on 2025-12-01, so the current default is zero. Kept as a
+    // field rather than deleted because a run over an earlier window has to be
+    // able to set it back to $0.0003.
+    Money cat_per_contract{};
 
     // Exercise, assignment, and worthless expiration are free at Robinhood.
     Money exercise_fee{};
     Money assignment_fee{};
 
     std::string schedule_id = "robinhood_equity_options_2026_04";
+
+    // Robinhood's index-option schedule, which is a different animal: a real
+    // per-contract commission, and neither the Section 31 fee nor the FINRA TAF
+    // is passed through.
+    static FeeSchedule robinhood_index_options(bool gold = false) {
+        FeeSchedule f;
+        f.commission_per_contract = Money::from_double(gold ? 0.35 : 0.50);
+        f.sec_fee_rate_per_dollar = 0.0;
+        f.finra_taf_per_contract = Money::zero();
+        f.schedule_id = gold ? "robinhood_index_options_gold_2026_04"
+                             : "robinhood_index_options_2026_04";
+        return f;
+    }
 
     // A charge below a cent is dropped rather than rounded up, matching how the
     // per-contract regulatory fees are actually billed.

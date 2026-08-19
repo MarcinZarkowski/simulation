@@ -12,7 +12,14 @@
 
 namespace obt {
 
-enum class MarginModelKind : uint8_t { CashAccount, RegT, Robinhood, PortfolioApprox };
+// No portfolio-margin model. There was a PortfolioApprox kind whose factory
+// returned a plain RegTMargin, while the run manifest recorded the model as
+// "portfolio_approx" -- so a reproducibility artifact named a methodology the run
+// had not applied. Robinhood does not offer portfolio margin (TIMS / OCC CPM) at
+// all: its published maintenance requirements run 25-100% with long options at
+// 100%, which is definitionally incompatible with portfolio margining. Offering a
+// mislabelled alias is worse than not offering the model.
+enum class MarginModelKind : uint8_t { CashAccount, RegT, Robinhood };
 
 // One short option and the long option, if any, that offsets it.
 struct SpreadPairing {
@@ -438,9 +445,28 @@ public:
     }
 };
 
-// Robinhood: Reg-T spread treatment, but retail accounts are not permitted
-// uncovered short calls at any approval level, and a short put is held at the
-// full strike rather than the Reg-T percentage.
+// Robinhood, as published (help centre and fee schedule, retrieved 2026-08).
+//
+// Two approval levels, 2 and 3. Neither permits an uncovered short call: "Although
+// you collect a larger premium for selling a naked call, it comes with the risk of
+// undefined losses, which is why you cannot use this strategy at Robinhood." The
+// Level 3 strategy list is consistent with that -- it offers a put front ratio and
+// a call back ratio but no call front ratio, and a short put calendar but no short
+// call calendar, so every strategy that would leave a net uncovered short call is
+// absent. Short strangles and straddles are likewise not offered; the documented
+// substitutes are the short iron condor and short iron butterfly.
+//
+// A short put is collateralized at the full strike in both cash and margin
+// accounts: "you must have enough buying power to purchase 100 shares of the
+// underlying stock for each put you sell". Robinhood never publishes a Reg-T
+// percentage for short puts, and the phrase "Regulation T" appears nowhere in its
+// margin agreement, customer agreement, or options agreement.
+//
+// Short stock IS now supported, in a margin account with a $2,000 minimum. The
+// sale proceeds are held rather than credited to buying power ("the cash received
+// from the sale is not added to your buying power. It is held aside"), and the
+// published maintenance ratio in Robinhood's own example is 30%. That gives 130%
+// of market value, not the Reg-T 150%.
 class RobinhoodMargin : public MarginModel {
 public:
     explicit RobinhoodMargin(bool allow_uncovered_calls = false)
@@ -452,11 +478,14 @@ public:
     MarginResult evaluate(const PositionBook& book, const ContractRegistry& registry,
                           const MarginContext& ctx) const override
     {
-        return evaluate_with(book, registry, ctx, NakedRules{
+        NakedRules rules{
             allow_uncovered_calls_ ? NakedPolicy::RegTMinimum : NakedPolicy::Disallow,
             NakedPolicy::FullStrike,
             "uncovered short call is not permitted at any retail approval level",
-            ""});
+            ""};
+        // Held proceeds plus Robinhood's published 30% maintenance ratio.
+        rules.short_stock_fraction = 1.30;
+        return evaluate_with(book, registry, ctx, rules);
     }
 
 private:
@@ -468,7 +497,6 @@ inline std::unique_ptr<MarginModel> make_margin_model(MarginModelKind kind) {
         case MarginModelKind::CashAccount: return std::make_unique<CashAccountMargin>();
         case MarginModelKind::RegT: return std::make_unique<RegTMargin>();
         case MarginModelKind::Robinhood: return std::make_unique<RobinhoodMargin>();
-        case MarginModelKind::PortfolioApprox: return std::make_unique<RegTMargin>();
     }
     return std::make_unique<RobinhoodMargin>();
 }

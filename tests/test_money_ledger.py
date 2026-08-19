@@ -340,6 +340,65 @@ class TestFeeArithmetic:
         assert schedule.option_fees(E.OrderSide.BUY, 4, 0.0) == pytest.approx(2.60)
 
 
+class TestPublishedRobinhoodFees:
+    """
+    Checked against Robinhood's fee schedule and help centre (2026-08). The rates
+    are configuration rather than constants precisely because they get revised:
+    Section 31 was literally $0 from 2025-05-14 to 2026-04-03, so a run spanning
+    that window has to be able to say so.
+    """
+
+    def test_the_cat_fee_defaults_to_zero(self):
+        """
+        Regulators stopped charging the Consolidated Audit Trail fee for equity and
+        options orders on 2025-12-01. The field stays so a run over an earlier
+        window can set it back.
+        """
+        assert E.FeeSchedule().cat_per_contract == 0.0
+
+    def test_equity_options_carry_no_commission(self):
+        schedule = E.FeeSchedule()
+
+        assert schedule.commission_per_contract == 0.0
+        assert schedule.commission_per_trade == 0.0
+
+    def test_the_blended_regulatory_pass_through_is_four_cents_both_sides(self):
+        """ORF plus OCC clearing, billed as one $0.04 line since 2025-01-10."""
+        schedule = E.FeeSchedule()
+
+        assert schedule.regulatory_per_contract == 0.04
+
+    def test_a_one_contract_equity_option_buy_costs_four_cents(self):
+        """
+        With the CAT fee gone, a buy is the regulatory pass-through alone: Section 31
+        and the activity fee are sell-side only.
+        """
+        assert E.FeeSchedule().option_fees(
+            E.OrderSide.BUY, 1, 500.0) == pytest.approx(0.04)
+
+    def test_index_options_charge_a_commission_and_no_ad_valorem_fees(self):
+        """
+        A different schedule entirely: $0.50 per contract non-Gold, $0.35 Gold, and
+        neither Section 31 nor the FINRA activity fee is passed through.
+        """
+        standard = E.FeeSchedule.robinhood_index_options()
+        gold = E.FeeSchedule.robinhood_index_options(gold=True)
+
+        assert standard.commission_per_contract == pytest.approx(0.50)
+        assert gold.commission_per_contract == pytest.approx(0.35)
+        for schedule in (standard, gold):
+            assert schedule.sec_fee_rate_per_dollar == 0.0
+            assert schedule.finra_taf_per_contract == 0.0
+            # A sell costs the same as a buy, because nothing is ad valorem.
+            assert (schedule.option_fees(E.OrderSide.SELL, 2, 10_000.0)
+                    == pytest.approx(schedule.option_fees(E.OrderSide.BUY, 2, 10_000.0)))
+
+    def test_each_schedule_names_itself_so_a_run_records_which_it_applied(self):
+        assert "equity_options" in E.FeeSchedule().schedule_id
+        assert "index_options" in E.FeeSchedule.robinhood_index_options().schedule_id
+        assert "gold" in E.FeeSchedule.robinhood_index_options(gold=True).schedule_id
+
+
 class TestEquityValuation:
     def test_equity_equals_cash_plus_position_value(self):
         c = make_contract(CALL, strike=100.0, expiry_day=60)

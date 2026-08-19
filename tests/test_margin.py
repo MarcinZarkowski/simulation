@@ -22,7 +22,6 @@ ALL_MODELS = [
     E.MarginModel.CASH_ACCOUNT,
     E.MarginModel.REG_T,
     E.MarginModel.ROBINHOOD,
-    E.MarginModel.PORTFOLIO_APPROX,
 ]
 
 
@@ -421,14 +420,6 @@ class TestRegTNakedFormula:
         )
         assert result.requirement_micros == micros(per_contract * contracts)
 
-    def test_portfolio_approx_falls_back_to_reg_t_numbers(self):
-        short = make_contract(1, strike=100.0, expiry_day=30)
-
-        approx = margin(E.MarginModel.PORTFOLIO_APPROX, [short], [(1, -1)], marks={1: 3.0})
-        reg_t = margin(E.MarginModel.REG_T, [short], [(1, -1)], marks={1: 3.0})
-
-        assert approx.requirement_micros == reg_t.requirement_micros
-
 
 class TestBrokerPermissions:
     def test_uncovered_short_call_is_refused_at_robinhood(self):
@@ -463,6 +454,111 @@ class TestBrokerPermissions:
         result = margin(E.MarginModel.ROBINHOOD, [short], [(1, -1)])
 
         assert not result.disallowed
+
+
+class TestRobinhoodMatchesThePublishedRules:
+    """
+    Checked against Robinhood's own help centre and fee schedule (2026-08). An
+    earlier audit claimed this model over-refuses -- that short strangles and
+    straddles are permitted at Level 3 -- and that is wrong. Robinhood publishes
+    two levels, neither permits an uncovered short call, and the documented Level 3
+    menu contains no short strangle or straddle. These tests exist so the claim
+    does not get 'fixed' back into a permission Robinhood does not grant.
+    """
+
+    def test_a_short_put_is_held_at_the_full_strike_not_a_reg_t_percentage(self):
+        """
+        "you must have enough buying power to purchase 100 shares of the underlying
+        stock for each put you sell". Stated identically for cash and margin
+        accounts, and Robinhood never publishes a Reg-T percentage for short puts.
+        """
+        short = make_contract(1, strike=95.0, expiry_day=30, is_call=False)
+
+        result = margin(E.MarginModel.ROBINHOOD, [short], [(1, -1)], marks={1: 3.0})
+        reg_t = margin(E.MarginModel.REG_T, [short], [(1, -1)], marks={1: 3.0})
+
+        assert result.requirement_micros == micros(95.0 * SHARES_PER_CONTRACT)
+        assert result.requirement_micros > reg_t.requirement_micros
+
+    def test_a_short_strangle_is_refused_because_its_call_leg_is_uncovered(self):
+        call = make_contract(1, strike=110.0, expiry_day=30)
+        put = make_contract(2, strike=90.0, expiry_day=30, is_call=False)
+
+        result = margin(E.MarginModel.ROBINHOOD, [call, put], [(1, -1), (2, -1)],
+                        marks={1: 2.0, 2: 2.0})
+
+        assert result.disallowed
+
+    def test_a_short_straddle_is_refused_for_the_same_reason(self):
+        call = make_contract(1, strike=100.0, expiry_day=30)
+        put = make_contract(2, strike=100.0, expiry_day=30, is_call=False)
+
+        result = margin(E.MarginModel.ROBINHOOD, [call, put], [(1, -1), (2, -1)],
+                        marks={1: 4.0, 2: 4.0})
+
+        assert result.disallowed
+
+    def test_a_short_iron_condor_is_permitted(self):
+        """The documented defined-risk substitute for a short strangle."""
+        legs = [
+            make_contract(1, strike=90.0, expiry_day=30, is_call=False),
+            make_contract(2, strike=85.0, expiry_day=30, is_call=False),
+            make_contract(3, strike=110.0, expiry_day=30),
+            make_contract(4, strike=115.0, expiry_day=30),
+        ]
+        holdings = [(1, -1), (2, 1), (3, -1), (4, 1)]
+
+        result = margin(E.MarginModel.ROBINHOOD, legs, holdings,
+                        marks={1: 2.0, 2: 1.0, 3: 2.0, 4: 1.0})
+
+        assert not result.disallowed
+        assert result.requirement > 0.0
+
+    def test_a_synthetic_short_is_refused_because_a_put_does_not_cover_a_call(self):
+        call = make_contract(1, strike=100.0, expiry_day=30)
+        put = make_contract(2, strike=100.0, expiry_day=30, is_call=False)
+
+        result = margin(E.MarginModel.ROBINHOOD, [call, put], [(1, -1), (2, 1)],
+                        marks={1: 4.0, 2: 4.0})
+
+        assert result.disallowed
+
+    def test_short_stock_is_charged_the_published_130_percent(self):
+        """
+        Short selling IS supported now, in a margin account. The proceeds are held
+        rather than credited to buying power, and Robinhood's published maintenance
+        ratio in its own worked example is 30% -- so 130% of market value, not the
+        Reg-T 150%.
+        """
+        result = margin(E.MarginModel.ROBINHOOD, [], [], shares={SYMBOL: -100})
+        reg_t = margin(E.MarginModel.REG_T, [], [], shares={SYMBOL: -100})
+
+        assert not result.disallowed
+        assert result.requirement_micros == micros(1.30 * SPOT * 100)
+        assert reg_t.requirement_micros == micros(1.50 * SPOT * 100)
+
+    def test_long_stock_is_still_the_reg_t_fifty_percent(self):
+        result = margin(E.MarginModel.ROBINHOOD, [], [], shares={SYMBOL: 100})
+
+        assert result.requirement_micros == micros(0.50 * SPOT * 100)
+
+
+class TestNoPortfolioMarginModel:
+    """
+    There was a PORTFOLIO_APPROX kind whose factory returned a plain RegTMargin,
+    while the manifest recorded the model as "portfolio_approx" -- a reproducibility
+    artifact naming a methodology the run had not applied. Robinhood does not offer
+    portfolio margin at all: its published maintenance requirements run 25-100%
+    with long options at 100%, which is incompatible with portfolio margining.
+    """
+
+    def test_the_kind_no_longer_exists(self):
+        assert not hasattr(E.MarginModel, "PORTFOLIO_APPROX")
+
+    def test_only_the_three_implemented_models_are_offered(self):
+        offered = {name for name in dir(E.MarginModel) if name.isupper()}
+
+        assert offered == {"CASH_ACCOUNT", "REG_T", "ROBINHOOD"}
 
 
 class TestIronCondor:
