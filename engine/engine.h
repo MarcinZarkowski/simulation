@@ -523,9 +523,15 @@ private:
             return false;
         }
 
-        Money net_cash = ledger_.cash();
-        for (const auto& p : plan) net_cash += p.gross_cash - p.fees;
-        if (net_cash + probe_market_value(probe) - res.requirement < Money::zero()) {
+        // Long options carry no loan value at any broker, so they cannot
+        // collateralize their own purchase: cash has to cover the debit in
+        // full. Only stock lends, and only in a margin account. Counting option
+        // market value here would let an empty account buy an unlimited premium.
+        Money available = ledger_.cash();
+        for (const auto& p : plan) available += p.gross_cash - p.fees;
+        available += scale(probe_equity_value(probe), equity_loan_fraction());
+
+        if (available - res.requirement < Money::zero()) {
             *reason = RejectReason::InsufficientBuyingPower;
             *detail = "requirement exceeds available buying power";
             return false;
@@ -555,8 +561,16 @@ private:
         ctx.underlying_price = current_.underlying_price;
         for (const auto& [sym, px] : last_underlying_)
             ctx.underlying_price.emplace(sym, px);
+
+        // Marks come from every contract quoted at this instant, not just the
+        // ones already held. A pre-trade probe evaluates a position that is not
+        // in the book yet, and without its mark the Reg-T naked requirement
+        // would silently drop its premium term and under-charge the order.
+        for (const MarketBar& b : current_.bars)
+            ctx.mark[b.contract_version_id.value] =
+                b.valuation_price.is_zero() ? b.close : b.valuation_price;
         for (const Position& p : book_.snapshot())
-            ctx.mark[p.contract_version_id.value] = mark_for(p.contract_version_id);
+            ctx.mark.emplace(p.contract_version_id.value, mark_for(p.contract_version_id));
         return ctx;
     }
 
@@ -567,6 +581,19 @@ private:
     // -----------------------------------------------------------------------
     // Valuation
     // -----------------------------------------------------------------------
+    // Reg-T initial requirement for stock is 50%, so half the position lends.
+    // A cash account lends nothing.
+    double equity_loan_fraction() const {
+        return cfg_.margin_model == MarginModelKind::CashAccount ? 0.0 : 0.5;
+    }
+
+    Money probe_equity_value(const PositionBook& book) const {
+        Money total = Money::zero();
+        for (const EquityPosition& e : book.equity_snapshot())
+            total += Money{underlying_of(e.symbol).micros * e.shares};
+        return total;
+    }
+
     Money position_market_value() const { return probe_market_value(book_); }
 
     Money probe_market_value(const PositionBook& book) const {

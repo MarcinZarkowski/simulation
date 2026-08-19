@@ -52,11 +52,74 @@ struct MarginContext {
 
 namespace detail {
 
+// Consumes shares to cover as many contracts of a naked short call as the
+// holding allows, splitting the pairing when it covers only part of it. Without
+// the split, 100 shares against 2 short calls would cover neither and both
+// contracts would be charged as naked.
+//
+// Returns the still-uncovered contract count, appending a covered pairing to
+// `out` when at least one contract was covered.
+inline int64_t consume_share_coverage(
+    SpreadPairing& p, int64_t shares_per_contract, int64_t& free_shares,
+    std::vector<SpreadPairing>& out)
+{
+    if (shares_per_contract <= 0 || free_shares < shares_per_contract) return p.contracts;
+
+    const int64_t coverable = std::min(p.contracts, free_shares / shares_per_contract);
+    free_shares -= coverable * shares_per_contract;
+    if (coverable == 0) return p.contracts;
+
+    SpreadPairing covered = p;
+    covered.contracts = coverable;
+    covered.covered_by_equity = true;
+    covered.naked = false;
+    covered.requirement = Money::zero();
+    out.push_back(covered);
+
+    return p.contracts - coverable;
+}
+
 struct LegView {
     ContractVersionId id{};
     const OptionContractVersion* contract = nullptr;
     int64_t contracts = 0;   // always positive
 };
+
+// A leg with its signed quantity, for max-loss evaluation.
+struct SignedLeg {
+    const OptionContractVersion* contract = nullptr;
+    int64_t quantity = 0;   // negative for short
+};
+
+inline Money intrinsic_at(const OptionContractVersion& c, Money underlying) {
+    return c.type == OptionType::Call
+        ? max_money(underlying - c.strike, Money::zero())
+        : max_money(c.strike - underlying, Money::zero());
+}
+
+// Greatest loss of a spread, evaluated at every strike present in it.
+//
+// This is the method FINRA 4210(f)(2)(H)(i) prescribes: compute the intrinsic
+// value of each leg at price points corresponding to every exercise price in the
+// spread, net them at each point, and take the worst result. Summing pairwise
+// widths instead would double-charge an iron condor, whose two wings cannot both
+// lose at once -- the requirement is the wider side, not the sum.
+//
+// Payoff is piecewise linear in the underlying with breakpoints only at strikes,
+// so the extremum over the whole price line is attained at one of them.
+inline Money max_potential_loss(const std::vector<SignedLeg>& legs) {
+    Money worst = Money::zero();
+    for (const SignedLeg& point : legs) {
+        Money net = Money::zero();
+        for (const SignedLeg& leg : legs) {
+            const Money value = intrinsic_at(*leg.contract, point.contract->strike);
+            net += Money{value.micros * leg.contract->deliverable_shares_per_contract()
+                         * leg.quantity};
+        }
+        if (net < worst) worst = net;
+    }
+    return Money{-worst.micros};
+}
 
 // Reg-T / CBOE minimum for an uncovered short option.
 //
@@ -97,8 +160,15 @@ inline Money reg_t_naked_requirement(
 // for a put pair max(0, K_short - K_long). A poor man's covered call therefore
 // pairs to zero residual, because its long LEAP sits below the short strike and
 // expires later. A bear call spread pairs to the strike width.
+struct PairingOutcome {
+    std::vector<SpreadPairing> pairings;
+    // Legs that entered a spread, for joint max-loss evaluation.
+    std::vector<SignedLeg> matched;
+};
+
 inline std::vector<SpreadPairing> pair_legs(
-    std::vector<LegView> shorts, std::vector<LegView> longs, OptionType type)
+    std::vector<LegView> shorts, std::vector<LegView> longs, OptionType type,
+    std::vector<SignedLeg>* matched = nullptr)
 {
     // Shortest-dated shorts first, so a scarce long-dated long is offered to
     // the short that most needs it.
@@ -133,16 +203,22 @@ inline std::vector<SpreadPairing> pair_legs(
                 out.push_back(p);
                 break;
             }
-            const int64_t matched = std::min(remaining, best->contracts);
+            const int64_t paired = std::min(remaining, best->contracts);
             const int64_t shares = s.contract->deliverable_shares_per_contract();
             SpreadPairing p;
             p.short_leg = s.id;
             p.long_leg = best->id;
-            p.contracts = matched;
-            p.requirement = Money{best_residual.micros * shares * matched};
+            p.contracts = paired;
+            // Pairwise residual, kept for reporting. The charged amount comes
+            // from joint max-loss netting, which is smaller when wings offset.
+            p.requirement = Money{best_residual.micros * shares * paired};
             out.push_back(p);
-            best->contracts -= matched;
-            remaining -= matched;
+            if (matched != nullptr) {
+                matched->push_back(SignedLeg{s.contract, -paired});
+                matched->push_back(SignedLeg{best->contract, paired});
+            }
+            best->contracts -= paired;
+            remaining -= paired;
         }
     }
     return out;
@@ -186,96 +262,128 @@ public:
 
 // Long options paid in full, short options fully collateralized: short puts by
 // cash equal to the strike, short calls by shares. No borrowing, so an
-// unsecured short is disallowed rather than charged.
+// How a short leg with no long partner and no share coverage is treated.
+enum class NakedPolicy : uint8_t {
+    // The account cannot carry it at all, so the position is refused.
+    Disallow,
+    // Regulation T / FINRA 4210(f)(2)(E)(i) minimum.
+    RegTMinimum,
+    // Fully collateralized at the strike, which is what a retail broker holds
+    // for a short put.
+    FullStrike,
+};
+
+struct NakedRules {
+    NakedPolicy call = NakedPolicy::Disallow;
+    NakedPolicy put = NakedPolicy::FullStrike;
+    const char* call_refusal = "uncovered short call is not permitted";
+    const char* put_refusal = "uncovered short put is not permitted";
+};
+
+// Shared evaluation. The three published models differ only in what they do
+// with an uncovered short, so the pairing, share-coverage, and max-loss netting
+// logic lives here once rather than three times.
+inline MarginResult evaluate_with(
+    const PositionBook& book, const ContractRegistry& registry,
+    const MarginContext& ctx, const NakedRules& rules)
+{
+    MarginResult res;
+    auto groups = detail::split_by_underlying(book.snapshot(), registry);
+
+    for (auto& [underlying, legs] : groups) {
+        const Money spot = ctx.underlying_or_zero(underlying);
+        int64_t free_shares = book.shares_of(underlying);
+
+        std::vector<detail::SignedLeg> matched;
+        auto call_pairs = detail::pair_legs(legs.short_calls, legs.long_calls,
+                                            OptionType::Call, &matched);
+        auto put_pairs = detail::pair_legs(legs.short_puts, legs.long_puts,
+                                           OptionType::Put, &matched);
+
+        // Every spread leg on this underlying is netted together, so offsetting
+        // wings are not both charged.
+        if (!matched.empty()) res.requirement += detail::max_potential_loss(matched);
+
+        auto settle_naked = [&](std::vector<SpreadPairing>& pairings, OptionType type) {
+            const NakedPolicy policy = type == OptionType::Call ? rules.call : rules.put;
+            const char* refusal = type == OptionType::Call ? rules.call_refusal
+                                                           : rules.put_refusal;
+            for (auto& p : pairings) {
+                if (!p.naked) {
+                    res.pairings.push_back(p);
+                    continue;
+                }
+                const OptionContractVersion* c = registry.find(p.short_leg);
+                if (c == nullptr) continue;
+
+                if (type == OptionType::Call) {
+                    p.contracts = detail::consume_share_coverage(
+                        p, c->deliverable_shares_per_contract(), free_shares, res.pairings);
+                    if (p.contracts == 0) continue;
+                }
+
+                switch (policy) {
+                    case NakedPolicy::Disallow:
+                        res.disallowed = true;
+                        res.disallowed_reason = refusal;
+                        break;
+                    case NakedPolicy::RegTMinimum:
+                        p.requirement = Money{
+                            detail::reg_t_naked_requirement(
+                                *c, spot, ctx.mark_or_zero(p.short_leg)).micros * p.contracts};
+                        res.requirement += p.requirement;
+                        break;
+                    case NakedPolicy::FullStrike:
+                        p.requirement = Money{c->strike.micros
+                            * c->deliverable_shares_per_contract() * p.contracts};
+                        res.requirement += p.requirement;
+                        break;
+                }
+                res.pairings.push_back(p);
+            }
+        };
+        settle_naked(call_pairs, OptionType::Call);
+        settle_naked(put_pairs, OptionType::Put);
+    }
+    return res;
+}
+
+// Long options paid in full, short options fully collateralized: short puts by
+// cash equal to the strike, short calls by shares. No borrowing, so an
+// unsecured short call is refused rather than charged.
 class CashAccountMargin : public MarginModel {
 public:
     MarginModelKind kind() const override { return MarginModelKind::CashAccount; }
     const char* name() const override { return "cash_account"; }
 
-    MarginResult evaluate(
-        const PositionBook& book, const ContractRegistry& registry,
-        const MarginContext& ctx) const override
+    MarginResult evaluate(const PositionBook& book, const ContractRegistry& registry,
+                          const MarginContext& ctx) const override
     {
-        MarginResult res;
-        auto groups = detail::split_by_underlying(book.snapshot(), registry);
-        for (auto& [underlying, legs] : groups) {
-            int64_t free_shares = book.shares_of(underlying);
-
-            for (auto& p : detail::pair_legs(legs.short_calls, legs.long_calls, OptionType::Call)) {
-                if (!p.naked) { res.requirement += p.requirement; res.pairings.push_back(p); continue; }
-                const OptionContractVersion* c = registry.find(p.short_leg);
-                const int64_t need = c->deliverable_shares_per_contract() * p.contracts;
-                if (free_shares >= need) {
-                    free_shares -= need;
-                    p.covered_by_equity = true;
-                } else {
-                    res.disallowed = true;
-                    res.disallowed_reason = "cash account cannot hold an uncovered short call";
-                }
-                res.pairings.push_back(p);
-            }
-
-            for (auto& p : detail::pair_legs(legs.short_puts, legs.long_puts, OptionType::Put)) {
-                if (!p.naked) { res.requirement += p.requirement; res.pairings.push_back(p); continue; }
-                const OptionContractVersion* c = registry.find(p.short_leg);
-                // Cash-secured: the full strike must be set aside.
-                p.requirement = Money{c->strike.micros * c->deliverable_shares_per_contract() * p.contracts};
-                res.requirement += p.requirement;
-                res.pairings.push_back(p);
-            }
-        }
-        return res;
+        return evaluate_with(book, registry, ctx, NakedRules{
+            NakedPolicy::Disallow, NakedPolicy::FullStrike,
+            "cash account cannot hold an uncovered short call",
+            "cash account short put must be cash secured"});
     }
 };
 
-// Regulation T minimums as published by CBOE/FINRA. Spreads are charged their
-// maximum loss; uncovered shorts use the 20%/10% formula.
+// Regulation T / FINRA 4210 minimums. Spreads are charged their maximum loss;
+// uncovered shorts use the 20%/10% formula.
 class RegTMargin : public MarginModel {
 public:
     MarginModelKind kind() const override { return MarginModelKind::RegT; }
     const char* name() const override { return "reg_t"; }
 
-    MarginResult evaluate(
-        const PositionBook& book, const ContractRegistry& registry,
-        const MarginContext& ctx) const override
+    MarginResult evaluate(const PositionBook& book, const ContractRegistry& registry,
+                          const MarginContext& ctx) const override
     {
-        MarginResult res;
-        auto groups = detail::split_by_underlying(book.snapshot(), registry);
-        for (auto& [underlying, legs] : groups) {
-            const Money spot = ctx.underlying_or_zero(underlying);
-            int64_t free_shares = book.shares_of(underlying);
-
-            auto charge = [&](std::vector<SpreadPairing> pairings) {
-                for (auto& p : pairings) {
-                    if (!p.naked) {
-                        res.requirement += p.requirement;
-                        res.pairings.push_back(p);
-                        continue;
-                    }
-                    const OptionContractVersion* c = registry.find(p.short_leg);
-                    const int64_t need = c->deliverable_shares_per_contract() * p.contracts;
-                    if (c->type == OptionType::Call && free_shares >= need) {
-                        free_shares -= need;
-                        p.covered_by_equity = true;
-                    } else {
-                        p.requirement = Money{
-                            detail::reg_t_naked_requirement(*c, spot, ctx.mark_or_zero(p.short_leg)).micros
-                            * p.contracts};
-                        res.requirement += p.requirement;
-                    }
-                    res.pairings.push_back(p);
-                }
-            };
-            charge(detail::pair_legs(legs.short_calls, legs.long_calls, OptionType::Call));
-            charge(detail::pair_legs(legs.short_puts, legs.long_puts, OptionType::Put));
-        }
-        return res;
+        return evaluate_with(book, registry, ctx, NakedRules{
+            NakedPolicy::RegTMinimum, NakedPolicy::RegTMinimum, "", ""});
     }
 };
 
-// Robinhood: Reg-T spread and cash-secured treatment, but retail accounts are
-// not permitted uncovered short calls at any approval level, so those are
-// refused rather than margined.
+// Robinhood: Reg-T spread treatment, but retail accounts are not permitted
+// uncovered short calls at any approval level, and a short put is held at the
+// full strike rather than the Reg-T percentage.
 class RobinhoodMargin : public MarginModel {
 public:
     explicit RobinhoodMargin(bool allow_uncovered_calls = false)
@@ -284,47 +392,14 @@ public:
     MarginModelKind kind() const override { return MarginModelKind::Robinhood; }
     const char* name() const override { return "robinhood"; }
 
-    MarginResult evaluate(
-        const PositionBook& book, const ContractRegistry& registry,
-        const MarginContext& ctx) const override
+    MarginResult evaluate(const PositionBook& book, const ContractRegistry& registry,
+                          const MarginContext& ctx) const override
     {
-        MarginResult res;
-        auto groups = detail::split_by_underlying(book.snapshot(), registry);
-        for (auto& [underlying, legs] : groups) {
-            const Money spot = ctx.underlying_or_zero(underlying);
-            int64_t free_shares = book.shares_of(underlying);
-
-            for (auto& p : detail::pair_legs(legs.short_calls, legs.long_calls, OptionType::Call)) {
-                if (!p.naked) { res.requirement += p.requirement; res.pairings.push_back(p); continue; }
-                const OptionContractVersion* c = registry.find(p.short_leg);
-                const int64_t need = c->deliverable_shares_per_contract() * p.contracts;
-                if (free_shares >= need) {
-                    free_shares -= need;
-                    p.covered_by_equity = true;
-                } else if (allow_uncovered_calls_) {
-                    p.requirement = Money{
-                        detail::reg_t_naked_requirement(*c, spot, ctx.mark_or_zero(p.short_leg)).micros
-                        * p.contracts};
-                    res.requirement += p.requirement;
-                } else {
-                    res.disallowed = true;
-                    res.disallowed_reason =
-                        "uncovered short call is not permitted at any retail approval level";
-                }
-                res.pairings.push_back(p);
-            }
-
-            for (auto& p : detail::pair_legs(legs.short_puts, legs.long_puts, OptionType::Put)) {
-                if (!p.naked) { res.requirement += p.requirement; res.pairings.push_back(p); continue; }
-                const OptionContractVersion* c = registry.find(p.short_leg);
-                // Short puts are collateralized at the full strike.
-                p.requirement = Money{
-                    c->strike.micros * c->deliverable_shares_per_contract() * p.contracts};
-                res.requirement += p.requirement;
-                res.pairings.push_back(p);
-            }
-        }
-        return res;
+        return evaluate_with(book, registry, ctx, NakedRules{
+            allow_uncovered_calls_ ? NakedPolicy::RegTMinimum : NakedPolicy::Disallow,
+            NakedPolicy::FullStrike,
+            "uncovered short call is not permitted at any retail approval level",
+            ""});
     }
 
 private:

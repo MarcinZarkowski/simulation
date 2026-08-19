@@ -359,15 +359,12 @@ PYBIND11_MODULE(obt_engine, m) {
         .def_property("finra_taf_cap_per_trade",
             [](const FeeSchedule& f) { return f.finra_taf_cap_per_trade.to_double(); },
             [](FeeSchedule& f, double v) { f.finra_taf_cap_per_trade = money_from(v); })
-        .def_property("orf_per_contract",
-            [](const FeeSchedule& f) { return f.orf_per_contract.to_double(); },
-            [](FeeSchedule& f, double v) { f.orf_per_contract = money_from(v); })
-        .def_property("clearing_per_contract",
-            [](const FeeSchedule& f) { return f.clearing_per_contract.to_double(); },
-            [](FeeSchedule& f, double v) { f.clearing_per_contract = money_from(v); })
-        .def_property("clearing_cap_per_trade",
-            [](const FeeSchedule& f) { return f.clearing_cap_per_trade.to_double(); },
-            [](FeeSchedule& f, double v) { f.clearing_cap_per_trade = money_from(v); })
+        .def_property("regulatory_per_contract",
+            [](const FeeSchedule& f) { return f.regulatory_per_contract.to_double(); },
+            [](FeeSchedule& f, double v) { f.regulatory_per_contract = money_from(v); })
+        .def_property("cat_per_contract",
+            [](const FeeSchedule& f) { return f.cat_per_contract.to_double(); },
+            [](FeeSchedule& f, double v) { f.cat_per_contract = money_from(v); })
         .def_property("exercise_fee",
             [](const FeeSchedule& f) { return f.exercise_fee.to_double(); },
             [](FeeSchedule& f, double v) { f.exercise_fee = money_from(v); })

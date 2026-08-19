@@ -20,5 +20,6 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pybind11>=3.0.4",
+    "pytest>=9.1.1",
     "setuptools>=84.0.0",
 ]
