@@ -154,7 +154,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="python -m optionsbacktester",
         description="Backtest an options strategy over the OptionsBackfill data lake",
     )
-    p.add_argument("command", choices=["run", "convergence"],
+    p.add_argument("command", choices=["run", "convergence", "sensitivity"],
                    help="run a backtest, or run one at several path counts to check "
                         "that the Monte Carlo error is falling as expected")
     p.add_argument("--strategy", required=True,
@@ -176,6 +176,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--spread-model", choices=sorted(SPREAD_MODELS),
                    default="conditional_lognormal")
     p.add_argument("--spread-calibration", help="JSON file of spread-model parameters")
+    p.add_argument("--spread-width-bps", type=float, default=None,
+                   help="median FULL bid/ask spread, in basis points of the mark, at "
+                        "the model's reference point. This is the width assumption "
+                        "itself; there is no free source of historical option NBBO, so "
+                        "it is a parameter to sweep rather than a calibrated constant")
+    p.add_argument("--spread-width-sweep", default=None,
+                   help="comma-separated widths in basis points for the `sensitivity` "
+                        "command, e.g. 20,55,120. Defaults to a spread of plausible "
+                        "values around the configured width")
+    p.add_argument("--spread-variance-sweep", default=None,
+                   help="comma-separated variance scales for the `sensitivity` command. "
+                        "Controls how WIDE the Monte Carlo is at a fixed median width")
     p.add_argument("--spread-variance-scale", type=float, default=1.0,
                    help="scale the dispersion of the drawn bid/ask spread without "
                         "moving its mean. 1.0 is the model as calibrated, 2.0 doubles "
@@ -222,10 +234,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def run_one(args: argparse.Namespace, ticker: str, paths: int | None = None):
+def run_one(args: argparse.Namespace, ticker: str, paths: int | None = None,
+            width_bps: float | None = None, variance_scale: float | None = None):
     cfg, calibration = build_config(args)
     if paths is not None:
         cfg.spread_mc_paths = paths
+    if width_bps is not None:
+        cfg.spread_model.median_full_spread_bps = width_bps
+    if variance_scale is not None:
+        cfg.spread_model.variance_scale = variance_scale
     strategy_cls = load_strategy(args.strategy)
     result = run(
         strategy_cls,

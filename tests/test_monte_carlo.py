@@ -274,7 +274,7 @@ class TestConvergence:
     """Properties 5 and 8: the estimator behaves like a Monte Carlo estimator."""
 
     # Analytic mean of the lognormal spread model. The half-spread in basis
-    # points is lognormal(log_base, log_sigma), so its mean is
+    # points is lognormal(log of the median width, log_sigma), so its mean is
     # exp(mu + sigma^2/2); a round trip pays it on two fills of 100 shares.
     LOG_BASE = 4.0
     LOG_SIGMA = 0.45

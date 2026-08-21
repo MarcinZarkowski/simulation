@@ -99,16 +99,29 @@ struct SpreadModelConfig {
     // ProportionalBps: full spread in basis points of the mark.
     double proportional_bps = 60.0;
 
-    // Lognormal / ConditionalLognormal, in log-basis-point space.
+    // ---------------------------------------------------------------------
+    // The two knobs that decide how wide the spread Monte Carlo is
+    // ---------------------------------------------------------------------
+    // These are the parameters, not calibrated constants. There is no free source
+    // of historical option NBBO, so execution cost is ASSUMED and the honest way to
+    // use this engine is to sweep the assumption and see how much of a result it
+    // owns. `optionsbacktester.sensitivity` does that sweep; these two are what it
+    // sweeps.
     //
-    // log_base is the log of the median full spread in basis points AT THE
-    // REFERENCE POINT below. The conditional terms are deviations from that
-    // reference, so this constant is directly interpretable and the documented
-    // magnitude is true by construction. Previously the betas were absolute, so
-    // log_base = 4.0 was documented as ~55 bps while actually producing 13 bps at
-    // any realistic volume -- which the min-spread floor then clamped away
-    // entirely, collapsing the whole Monte Carlo onto a single value.
-    double log_base = 4.007;        // exp(4.007) = 55 bps at the reference point
+    // WIDTH: the median full bid/ask spread in basis points of the mark, at the
+    // reference point below. Directly interpretable -- 55 means the median quote is
+    // 55 bps wide -- and the conditional terms move it from there.
+    //
+    // Stored in basis points rather than as its logarithm. It used to be `log_base`,
+    // a log of basis points, which is the kind of parameter nobody sets correctly
+    // twice: the previous value of 4.0 was documented as "~55 bps" while actually
+    // producing 13 bps at realistic volume, because the betas were absolute rather
+    // than deviations from a reference. Naming the unit removes the whole class of
+    // mistake.
+    double median_full_spread_bps = 55.0;
+
+    // DISPERSION: log-space standard deviation of the draw. Together with the width
+    // above this fixes the distribution; variance_scale then stretches it.
     double log_sigma = 0.45;
 
     // Reference point the conditional betas are measured against.
@@ -116,17 +129,20 @@ struct SpreadModelConfig {
     double ref_days_to_expiry = 30.0;
     double ref_volume = 5000.0;
 
-    // Scales the dispersion of the drawn spread without touching its central
-    // tendency. 1.0 leaves the model as calibrated; 2.0 doubles the log-space
-    // standard deviation; 0.0 collapses every draw onto the mean, which turns the
-    // Monte Carlo into a single deterministic path.
+    // How wide a Monte Carlo to run. Scales the dispersion of the drawn spread
+    // without touching its central tendency: 1.0 is the model as configured, 2.0
+    // doubles the log-space standard deviation, 0.0 collapses every draw onto the
+    // mean and turns the Monte Carlo into a single deterministic path.
     //
-    // This is the knob for asking "how much of my result is owned by the spread
-    // assumption?". Because a lognormal's mean is exp(mu + sigma^2/2), changing
-    // sigma alone would also move the mean and confound level with dispersion, so
-    // preserve_mean_under_variance_scale compensates mu to hold E[spread] fixed.
+    // Because a lognormal's mean is exp(mu + sigma^2/2), changing sigma alone would
+    // also move the mean and confound WIDTH with DISPERSION. So mu is compensated to
+    // hold E[spread] fixed, which is what makes the two knobs independent and what
+    // makes a sweep over one of them interpretable.
     double variance_scale = 1.0;
     bool preserve_mean_under_variance_scale = true;
+
+    // Natural log of the median width, which is the form the lognormal draw needs.
+    double log_width() const { return std::log(std::max(median_full_spread_bps, 1e-9)); }
     double beta_iv = 0.90;
     double beta_log_dte = -0.15;
     double beta_log_volume = -0.12;
@@ -191,14 +207,14 @@ inline double half_spread_dollars(
 
         case SpreadModelKind::Lognormal: {
             const double sigma = cfg.effective_sigma();
-            const double bps = std::exp(cfg.mean_preserving_mu(cfg.log_base, sigma)
+            const double bps = std::exp(cfg.mean_preserving_mu(cfg.log_width(), sigma)
                                         + sigma * standard_normal(key));
             half = f.mark_dollars * bps / 20000.0;
             break;
         }
 
         case SpreadModelKind::ConditionalLognormal: {
-            const double mu = cfg.log_base
+            const double mu = cfg.log_width()
                 + cfg.beta_iv * (f.implied_volatility - cfg.ref_implied_volatility)
                 + cfg.beta_log_dte * (std::log1p(std::max(0.0, f.days_to_expiry))
                                       - std::log1p(cfg.ref_days_to_expiry))

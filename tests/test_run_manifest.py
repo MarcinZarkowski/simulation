@@ -125,7 +125,7 @@ class TestEveryThingThatChangesANumberChangesTheHash:
 
     def test_a_spread_calibration_parameter(self, lake):
         cfg = base_config()
-        cfg.spread_model.log_base = 4.5
+        cfg.spread_model.median_full_spread_bps = 90.0
 
         assert hash_of(lake) != hash_of(lake, config=cfg)
 

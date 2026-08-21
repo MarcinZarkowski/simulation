@@ -392,7 +392,7 @@ class TestCliWorkflow:
 
         root = F.ramp_lake(tmp_path, per_day=0.4, trading_days=12, bars_per_day=2)
         cal = tmp_path / "cal.json"
-        cal.write_text(json.dumps({"log_sigma": 0.9, "log_base": 3.5}))
+        cal.write_text(json.dumps({"log_sigma": 0.9, "median_full_spread_bps": 33.0}))
 
         main([
             "run", "--strategy", "optionsbacktester.strategies.pmcc:PoorMansCoveredCall",
@@ -402,4 +402,4 @@ class TestCliWorkflow:
             "--zero-fees", "--json",
         ])
         payload = json.loads(capsys.readouterr().out)
-        assert payload["calibration"] == {"log_sigma": 0.9, "log_base": 3.5}
+        assert payload["calibration"] == {"log_sigma": 0.9, "median_full_spread_bps": 33.0}

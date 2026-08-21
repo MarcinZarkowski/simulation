@@ -381,7 +381,8 @@ PYBIND11_MODULE(obt_engine, m) {
         .def_readwrite("kind", &SpreadModelConfig::kind)
         .def_readwrite("constant_cents", &SpreadModelConfig::constant_cents)
         .def_readwrite("proportional_bps", &SpreadModelConfig::proportional_bps)
-        .def_readwrite("log_base", &SpreadModelConfig::log_base)
+        .def_readwrite("median_full_spread_bps", &SpreadModelConfig::median_full_spread_bps)
+        .def_property_readonly("log_width", &SpreadModelConfig::log_width)
         .def_readwrite("log_sigma", &SpreadModelConfig::log_sigma)
         .def_readwrite("ref_implied_volatility", &SpreadModelConfig::ref_implied_volatility)
         .def_readwrite("ref_days_to_expiry", &SpreadModelConfig::ref_days_to_expiry)
@@ -695,7 +696,7 @@ PYBIND11_MODULE(obt_engine, m) {
         spread["kind"] = static_cast<int>(s.kind);
         spread["constant_cents"] = s.constant_cents;
         spread["proportional_bps"] = s.proportional_bps;
-        spread["log_base"] = s.log_base;
+        spread["median_full_spread_bps"] = s.median_full_spread_bps;
         spread["log_sigma"] = s.log_sigma;
         spread["ref_implied_volatility"] = s.ref_implied_volatility;
         spread["ref_days_to_expiry"] = s.ref_days_to_expiry;

@@ -58,7 +58,7 @@ class TestShippedDefaults:
 
     def test_reference_point_median_matches_its_documented_magnitude(self):
         """
-        log_base is documented as the log median spread in basis points at the
+        median_full_spread_bps is documented as the median spread in basis points at the
         reference point. It has to actually be that, or the constant is
         uninterpretable and the calibration is guesswork.
         """
@@ -68,7 +68,7 @@ class TestShippedDefaults:
         cfg.min_half_spread_cents = 0.0
         half = E.spread_draw(cfg, default_features(REFERENCE_MARK), 1, 0, 1, 1, 0, 0)
         full_bps = 2.0 * half / REFERENCE_MARK * 10_000
-        assert full_bps == pytest.approx(math.exp(cfg.log_base), rel=0.01)
+        assert full_bps == pytest.approx(cfg.median_full_spread_bps, rel=0.01)
 
     @pytest.mark.parametrize("mark", [2.00, 5.00, 25.00])
     def test_defaults_produce_dispersion(self, mark):
@@ -488,15 +488,15 @@ class TestSpreadAbsoluteValues:
         got = E.spread_draw(cfg, default_features(mark), 1, 0, 1, 1, 0, 0)
         assert got == pytest.approx(expected_half, rel=1e-9)
 
-    def test_lognormal_median_is_exp_log_base_in_basis_points(self):
+    def test_lognormal_median_is_the_configured_width_in_basis_points(self):
         cfg = self._bare(E.SpreadModelKind.LOGNORMAL)
-        cfg.log_base = math.log(80.0)
+        cfg.median_full_spread_bps = 80.0
         got = E.spread_draw(cfg, default_features(10.0), 1, 0, 1, 1, 0, 0)
         assert got == pytest.approx(10.0 * 80.0 / 20000.0, rel=1e-9)
 
-    def test_conditional_median_at_the_reference_point_is_exp_log_base(self):
+    def test_conditional_median_at_the_reference_point_is_the_configured_width(self):
         cfg = self._bare(E.SpreadModelKind.CONDITIONAL_LOGNORMAL)
-        cfg.log_base = math.log(45.0)
+        cfg.median_full_spread_bps = 45.0
         got = E.spread_draw(cfg, default_features(20.0), 1, 0, 1, 1, 0, 0)
         assert got == pytest.approx(20.0 * 45.0 / 20000.0, rel=1e-9)
 
